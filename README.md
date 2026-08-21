@@ -1,39 +1,67 @@
 # Análise do WackyWacky
 
-Projeto dedicado a caracterizar uma prévia do dataset WackyWacky ainda em
-geração. O resultado esperado é um conjunto de métricas, tabelas e figuras para
-descrever, em artigo científico, os dados disponíveis em uma data de corte.
+Pacote independente para caracterizar cópias imutáveis de `pages.tsv` e `domain.tsv` sem carregar o corpus na memória. A execução é manual na processadora; o projeto não automatiza SSH e nunca modifica os TSVs.
 
-## Escopo
+## Visões do corpus
 
-- `pages.tsv`: estrutura, estados de coleta, disponibilidade e integridade de
-  `text`, distribuição de palavras, vocabulário, tamanho, idioma, repetição e
-  outros indicadores de qualidade textual.
-- `domain.tsv`: quantidade, níveis de recursão, requisições, relações pai-filho
-  e concentração das páginas por domínio.
-- Cruzamento por `pages.domain_id = domain.id` para medir cobertura,
-  diversidade e possíveis inconsistências.
+- `R_valid`: páginas `done` com texto hexadecimal/Zstandard/UTF-8 válido e não vazio.
+- `E_exact`: `R_valid` após deduplicação exata normalizada.
+- `B_clean`: `E_exact` após remoção intradomínio aprovada por revisão e nova deduplicação. É a visão lexical principal.
+- `N_near`: sensibilidade opcional por MinHash e Jaccard; não altera `B_clean`.
 
+## Instalação
 
-## Fonte
+Requer Python 3.12 e [`uv`](https://docs.astral.sh/uv/). As dependências, inclusive `pt_core_news_sm==3.8.0`, estão em `uv.lock`.
 
-O dataset fica fora deste repositório e deve ser acessado somente para leitura.
-`pages.text` contém um frame Zstandard representado em hexadecimal; a análise
-deve decodificá-lo como UTF-8 e validar `text_md5` antes das estatísticas
-linguísticas.
+```bash
+uv sync --extra dev
+```
 
-Como a coleta continua ativa, todo resultado deve informar a data de corte e
-ser descrito como parcial.
+Copie `configs/full.toml`, ajuste caminhos, data de corte e orçamento da máquina, e versione a configuração usada no artigo.
 
-## Estado
+## Prévia local com dados reais
 
-A base documental está criada. A implementação da análise ainda não foi
-iniciada.
+O perfil `tiny` cria uma amostra privada determinística de até 10 mil páginas. Ele lê janelas distribuídas da fonte, não os 52 GB completos, e serve apenas para validar o pipeline e os gráficos; seus agregados não estimam o corpus.
 
-## Documentação
+```bash
+export WACKYWACKY_DATA_ROOT=/caminho/para/wacky
+uv run wackywacky sample --config configs/tiny.toml
+uv run wackywacky verify --config configs/tiny.toml
+uv run wackywacky run --config configs/tiny.toml
+```
 
-- [Dataset e estado conhecido](docs/dataset.md)
-- [Escopo da análise](docs/analysis.md)
+A amostra fica em `work/`, sem URLs de páginas, HTML ou campos não analíticos. Se houver candidatos a boilerplate, use o mesmo fluxo de revisão descrito abaixo e retome com `--resume`.
 
-Os resultados devem ser agregados e reproduzíveis. Textos, URLs e domínios
-reais não devem aparecer nos artefatos publicados.
+## Execução
+
+```bash
+uv run wackywacky verify --config configs/full.toml
+uv run wackywacky run --config configs/full.toml
+```
+
+Quando houver candidatos intradomínio, `run` termina com código 2 e grava a amostra privada em `work/`. Rotule cada item como `boilerplate`, `conteúdo` ou `incerto`:
+
+```bash
+uv run wackywacky review export --config configs/full.toml
+uv run wackywacky review import --config configs/full.toml --input /caminho/revisao.csv
+uv run wackywacky run --config configs/full.toml --resume
+```
+
+Comandos independentes:
+
+```bash
+uv run wackywacky near-duplicates --config configs/full.toml
+uv run wackywacky render --config configs/full.toml --snapshot-id SNAPSHOT_ID
+```
+
+`render` lê somente agregados. Scratch, Parquet, bancos e revisão privada ficam ignorados; `results/<snapshot-id>/` contém apenas manifests, tabelas e figuras publicáveis.
+
+## Validação local
+
+```bash
+uv run pytest
+```
+
+Somente os testes usam dados sintéticos. A execução integral deve ocorrer na processadora após o `verify` confirmar hashes e pelo menos 300 GB livres de scratch.
+
+Detalhes: [dataset](docs/dataset.md) e [metodologia](docs/analysis.md).

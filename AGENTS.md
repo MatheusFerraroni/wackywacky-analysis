@@ -1,24 +1,14 @@
 # AGENTS.md
 
-## Objetivo
+Objetivo: caracterizar de forma agregada e reproduzível o snapshot parcial WackyWacky.
 
-Analisar a prévia em evolução do dataset WackyWacky e produzir estatísticas
-agregadas, reproduzíveis e adequadas para um artigo científico.
+Leia `README.md`, `docs/dataset.md` e `docs/analysis.md`.
 
-## Leitura obrigatória
+Regras:
 
-- [README.md](README.md): escopo e estado do projeto.
-- [docs/dataset.md](docs/dataset.md): estrutura e fatos conhecidos da fonte.
-- [docs/analysis.md](docs/analysis.md): perguntas e princípios da análise.
-
-## Regras
-
-- Foque em `pages.tsv`, `domain.tsv` e na relação `pages.domain_id = domain.id`.
-- Trate a fonte externa como somente leitura; não copie nem versione o dataset.
-- Processe arquivos grandes por streaming e evite leituras integrais sem necessidade.
-- Não exponha textos, URLs ou domínios reais em logs, testes ou documentos.
-- Separe fatos medidos de estimativas e registre a data de corte do snapshot.
-- Produza apenas resultados agregados e métodos reproduzíveis.
-- Mantenha código e documentação diretos e pequenos.
-- Atualize o `README.md` e os arquivos em `docs/` quando escopo, fonte, método ou
-  resultados mudarem. Registre aqui qualquer novo documento obrigatório.
+- trate `pages.tsv` e `domain.tsv` como fontes externas imutáveis;
+- processe em streaming e respeite os limites de memória e scratch da configuração;
+- nunca publique textos ou URLs; hosts reais só podem aparecer em tabelas agregadas;
+- separe `R_valid`, `E_exact`, `B_clean` e a sensibilidade opcional `N_near`;
+- use apenas fixtures sintéticas nos testes;
+- mantenha README e docs curtos e atualizados quando método, interface ou resultado mudar.

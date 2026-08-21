@@ -1,0 +1,52 @@
+schema_version = 1
+cutoff_date = "2026-08-20"
+profile = "full"
+
+[paths]
+pages = "/dados/wacky/pages.tsv"
+domains = "/dados/wacky/domain.tsv"
+work = "/scratch/wackywacky/work"
+results = "results"
+
+[runtime]
+workers = 8
+memory_limit = "96GiB"
+minimum_scratch_free_bytes = 300000000000
+chunk_bytes = 268435456
+max_line_bytes = 134217728
+max_text_bytes = 134217728
+max_rows = 0
+queue_bytes = 1073741824
+
+[source]
+header = "auto"
+require_immutable = true
+
+[boilerplate]
+enabled = true
+paragraph_min_chars = 80
+block_lines = 3
+block_min_chars = 60
+review_paragraphs = 100
+review_blocks = 100
+review_seed = 73129
+precision_min = 0.95
+wilson_lower_min = 0.90
+
+[lexical]
+spacy_model = "pt_core_news_sm"
+partitions = 256
+spill_terms = 2000000
+bigram_candidates = 1000000
+published_items = 100
+figure_items = 30
+
+[near_duplicates]
+enabled = false
+minimum_words = 50
+shingle_words = 5
+hashes = 112
+bands = 14
+rows_per_band = 8
+jaccard = 0.85
+seed = 73129

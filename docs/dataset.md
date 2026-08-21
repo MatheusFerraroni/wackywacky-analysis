@@ -1,52 +1,34 @@
 # Dataset e estado conhecido
 
-## Natureza da fonte
-
-O WackyWacky é um dataset em geração. A pasta analisada é uma exportação parcial
-de um crawler MySQL e não deve ser tratada como versão final ou snapshot
-necessariamente transacional.
+O WackyWacky é uma exportação parcial de um crawler ainda em execução. A análise usa somente cópias locais imutáveis e registra uma data de corte; não presume que a origem tenha sido transacional.
 
 Estado observado em 2026-08-20:
 
-| Arquivo | Tamanho | Estrutura |
-| --- | ---: | --- |
-| `pages.tsv` | 56.205.366.282 bytes | 19 colunas |
-| `domain.tsv` | 66.912.833 bytes | 9 colunas |
+| Arquivo | Tamanho observado | Colunas |
+| --- | ---: | ---: |
+| `pages.tsv` | 56.205.366.282 bytes | 19 |
+| `domain.tsv` | 66.912.833 bytes | 9 |
 
 ## `pages.tsv`
 
-Campos centrais: `id`, `domain_id`, `same_as`, `status`, `url`, `url_final`,
-`title`, `text`, `text_md5` e `recursion_level`.
+Campos analíticos: `id`, `domain_id`, `parent_page_id`, `same_as`, `status_code`, `recursion_level`, `status`, `retry_count`, `text` e `text_md5`. URLs e títulos existem na fonte, mas não são lidos para a análise pública.
 
-`text` não é texto puro. O fluxo esperado é:
+`text` segue `hexadecimal → Zstandard → UTF-8`. `NULL`, vazio e `\N` representam ausência. `text_md5` é apenas diagnóstico (`ausente`, `inválido`, `correspondente` ou `divergente`); a identidade científica usa SHA-256 calculado pelo pacote.
 
-```text
-hexadecimal -> bytes Zstandard -> bytes descompactados -> UTF-8
-```
-
-O marcador literal `NULL` representa ausência em vários campos. `same_as`
-aponta para outra página quando o crawler identifica duplicação.
-
-Uma amostra limitada e distribuída pelo arquivo encontrou 29.278 linhas com 19
-campos válidos. Entre 719 textos elegíveis amostrados, todos foram
-descompactados, mas 299 divergiram de `text_md5`. Esses números são
-preliminares e não representam a distribuição global.
-
-O total de linhas permanece desconhecido. A fonte aparenta estar ordenada por
-estado e possui registros de tamanhos muito diferentes; amostras por offset não
-devem ser usadas como contagem definitiva.
+`same_as` é medido antes de exclusões e comparado com as duplicações por bytes e texto normalizado. Referências ausentes são reportadas, não corrigidas.
 
 ## `domain.tsv`
 
-Campos centrais: `id`, `url`, `parent_domain_id`, `recursion_level`,
-`request_count` e `last_request_at`.
+Campos analíticos: `id`, `url`, `parent_domain_id`, `recursion_level`, `status`, `request_count` e datas. O parser lê bytes e ignora `url_md5`, que pode conter dados binários. Da URL são derivados somente host e domínio registrável usando uma Public Suffix List offline.
 
-Os IDs observados são esparsos. Uma estimativa preliminar indica cerca de 615
-mil registros, mas a contagem precisa deve ser obtida por uma passagem completa
-em streaming.
+IDs duplicados, pais ausentes, profundidade, requisições, hosts e agrupamento Wikimedia são medidos. `pages.domain_id` é validado contra `domain.id`.
 
-## Relação e consistência
+## Limites
 
-`pages.domain_id` referencia `domain.id`. Como a exportação ocorreu enquanto o
-crawler aparentava continuar ativo, a análise deve medir referências ausentes
-e registrar a data de corte usada.
+Linhas e textos descompactados têm limite padrão de 128 MiB. Linhas excessivas são drenadas até `\n` sem acumulação.
+
+O perfil `tiny` extrai até 10 mil páginas de janelas distribuídas da fonte e então analisa somente essa cópia privada. URLs de páginas, HTML e demais campos sem uso analítico são substituídos por `NULL`. A amostra não é representativa e seus resultados recebem marca explícita de prévia.
+
+O `tiny` usa um trabalhador e orçamento inferior a 768 MiB. O `full` usa oito trabalhadores, limite DuckDB de 96 GiB e exige 300 GB livres além dos TSVs.
+
+Os números acima descrevem apenas a prévia observada. Totais científicos devem vir de `manifest.json` e `summary.json` do snapshot executado.

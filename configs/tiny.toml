@@ -1,0 +1,62 @@
+schema_version = 1
+cutoff_date = "2026-08-20"
+profile = "tiny"
+
+[paths]
+pages = "${WACKYWACKY_DATA_ROOT}/pages.tsv"
+domains = "${WACKYWACKY_DATA_ROOT}/domain.tsv"
+work = "work"
+results = "results"
+
+[runtime]
+workers = 1
+memory_limit = "640MiB"
+minimum_scratch_free_bytes = 0
+chunk_bytes = 8388608
+max_line_bytes = 134217728
+max_text_bytes = 134217728
+max_rows = 0
+queue_bytes = 67108864
+
+[source]
+header = "auto"
+require_immutable = true
+
+[sampling]
+enabled = true
+target_rows = 10000
+candidate_rows = 200000
+windows = 64
+window_bytes = 16777216
+done_fraction = 0.80
+same_as_reserve = 500
+seed = 73129
+
+[boilerplate]
+enabled = true
+paragraph_min_chars = 80
+block_lines = 3
+block_min_chars = 60
+review_paragraphs = 100
+review_blocks = 100
+review_seed = 73129
+precision_min = 0.95
+wilson_lower_min = 0.90
+
+[lexical]
+spacy_model = "pt_core_news_sm"
+partitions = 256
+spill_terms = 50000
+bigram_candidates = 10000
+published_items = 100
+figure_items = 30
+
+[near_duplicates]
+enabled = false
+minimum_words = 50
+shingle_words = 5
+hashes = 112
+bands = 14
+rows_per_band = 8
+jaccard = 0.85
+seed = 73129

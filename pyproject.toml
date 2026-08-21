@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wackywacky-analysis"
+version = "0.1.0"
+description = "Análise streaming e reproduzível do corpus parcial WackyWacky"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "duckdb>=1.4,<2",
+  "matplotlib>=3.10,<4",
+  "numpy>=2.0,<3",
+  "pyarrow>=21,<27",
+  "spacy>=3.8,<4",
+  "pt-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.8.0/pt_core_news_sm-3.8.0-py3-none-any.whl",
+  "tldextract>=5.3,<6",
+  "zstandard>=0.23,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "psutil>=7,<8",
+  "pytest>=8.4,<10",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+wackywacky = "wackywacky_analysis.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wackywacky_analysis"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

@@ -1,0 +1,3 @@
+id	domain_id	parent_page_id	same_as	url	url_md5	url_final	url_final_md5	status_code	title	recursion_level	status	retry_count	text	html	text_md5	html_md5	created_at	updated_at
+1	1	NULL	NULL	https://fixture.invalid/1	NULL	NULL	NULL	200	NULL	0	done	0	28b52ffd203ad10100546578746f2073696e74c3a97469636f20656d20706f7274756775c3aa7320706172612076616c69646172206f2070657266696c2074696e792e	NULL	227bc73969678f7a8bd1dfb2a4821831	NULL	2026-08-20	2026-08-20
+2	1	NULL	NULL	https://fixture.invalid/2	NULL	NULL	NULL	NULL	NULL	0	pending	0	NULL	NULL	NULL	NULL	2026-08-20	2026-08-20

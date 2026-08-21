@@ -1,1 +1,21 @@
 .DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Artefatos pesados e privados do pipeline.
+work/
+scratch/
+*.partial
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Os relatórios pequenos em results/ são deliberadamente versionáveis.
