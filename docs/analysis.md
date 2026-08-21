@@ -9,7 +9,7 @@ No perfil `tiny`, `sample` lê janelas determinísticas distribuídas por `pages
 3. A primeira passagem de páginas mede todos os estados e, para `done`, decodifica o texto sem usar `text_md5` como filtro. Features e hashes são persistidos; texto descompactado não.
 4. D1 usa SHA-256 dos bytes; D2 usa SHA-256 após normalização NFC e de layout. O menor `pages.id`, depois a linha, é o representante.
 5. Fragmentos exatos intradomínio são candidatos quando atingem `max(5, min(100, ceil(0,001 × N)))`. Repetições cross-domain são apenas medidas.
-6. Uma amostra determinística privada contém até 100 parágrafos e 100 blocos. A limpeza só é autorizada com precisão ≥95% e limite inferior de Wilson 95% ≥90%; `incerto` é erro.
+6. Uma amostra determinística privada contém até 100 parágrafos e 100 blocos. A limpeza só é autorizada com precisão ≥95% e limite inferior de Wilson 95% ≥90%; `incerto` é erro. Candidatos aprovados são indexados diretamente por domínio, tipo e hash, sem expansão por documento.
 7. A segunda passagem remove a união das ocorrências aprovadas, sem regra global para linhas curtas. Só textos vazios saem de `B_clean`; D3 deduplica novamente.
 8. A passagem lexical calcula formas observadas e lemas com spaCy. Palavras são tokens alfabéticos; números e outros tokens ficam separados. Bigramas não atravessam parágrafos.
 9. Frequências de formas/lemas usam spills e 256 partições; bigramas usam Space-Saving e recontagem exata. O top-K só é publicado quando o limite do item omitido fica abaixo do último item publicado.
@@ -38,6 +38,6 @@ A primeira versão não analisa tempo, segurança/ética, Heaps ou classificaç�
 
 ## Reprodutibilidade e falhas
 
-Chunks são gravados como `.partial`, validados e renomeados antes de atualizar `state.json`. Representantes são listas `u64` ordenadas consultadas por merge. DuckDB recebe limites explícitos de memória e temporários; lotes spaCy são limitados por bytes. Mudança de fonte, configuração ou modelo invalida a retomada.
+Chunks são gravados como `.partial`, validados e renomeados antes de atualizar `state.json`. O índice versionado de candidatos confirma batches no próprio `.partial` e retoma da última chave. Representantes são listas `u64` ordenadas consultadas por merge. DuckDB recebe limites explícitos de memória e temporários; lotes spaCy são limitados por bytes. Mudança de fonte, configuração ou modelo invalida a retomada.
 
 Parâmetros de near-duplicate seguem a configuração publicada do [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/v1.4.0/README.md); candidatos são confirmados por similaridade exata, em linha com [Lee et al. (2022)](https://aclanthology.org/2022.acl-long.577/).

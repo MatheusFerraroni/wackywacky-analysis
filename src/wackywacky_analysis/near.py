@@ -132,7 +132,8 @@ def run_near_duplicates(config: Config, root: Path) -> dict:
                 decoded = decode_text(fields[13], fields[15], config.runtime.max_text_bytes)
             except TextDecodeFailure:
                 continue
-            clean = _clean_again(config, boilerplate, decoded.normalized, decoded.normalized_sha256)
+            domain_id = parse_int(fields[1])
+            clean = _clean_again(config, boilerplate, domain_id, decoded.normalized)
             words = _token_data(nlp(clean))[4]
             if len(words) < near.minimum_words:
                 continue
@@ -141,7 +142,6 @@ def run_near_duplicates(config: Config, root: Path) -> dict:
                 continue
             signature = _signature(shingles, parameters)
             clean_sha = hashlib.sha256(clean.encode()).hexdigest()
-            domain_id = parse_int(fields[1])
             metadata[record.row_number] = (len(words), domain_id, clean_sha)
             sql.execute(
                 "INSERT OR REPLACE INTO document VALUES (?, ?, ?, ?, ?)",

@@ -9,10 +9,10 @@ import pytest
 from conftest import domain_row, page_row, write_config, write_sources
 
 from wackywacky_analysis.config import load_config
-from wackywacky_analysis.errors import ReviewRequired
+from wackywacky_analysis.errors import ReviewRequired, WackyWackyError
 from wackywacky_analysis.near import run_near_duplicates
 from wackywacky_analysis.pipeline import run_pipeline
-from wackywacky_analysis.review import import_review
+from wackywacky_analysis.review import export_review, import_review
 from wackywacky_analysis.snapshot import verify_snapshot
 
 
@@ -42,7 +42,22 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
     manifest = verify_snapshot(config)
     root = config.paths.work / manifest["snapshot_id"]
     sample = root / "review" / "boilerplate-review.csv"
+    with sample.open("r", encoding="utf-8", newline="") as handle:
+        review_rows = list(csv.DictReader(handle))
+    assert sample.read_text(encoding="utf-8").count("\n") == len(review_rows) + 1
+    assert list(review_rows[0])[:2] == ["sample_id", "frequencia"]
+    assert all(int(row["frequencia"]) >= 5 for row in review_rows)
+    assert all(row["label"] == "boilerplate" for row in review_rows)
+    assert all("\n" not in row["text_preview"] for row in review_rows)
+    assert all("text" not in row for row in review_rows)
+    assert (
+        "altere somente as exceções"
+        in (sample.parent / "LEIA-ME-revisao.txt").read_text(encoding="utf-8").casefold()
+    )
+    assert export_review(config, manifest, root) == sample
     _label_review(sample)
+    with pytest.raises(WackyWackyError, match="foi alterado"):
+        export_review(config, manifest, root)
     gate = import_review(config, root, sample)
     assert gate["status"] == "approved"
     completed = run_pipeline(config, resume=True)

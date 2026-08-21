@@ -39,7 +39,11 @@ uv run wackywacky verify --config configs/full.toml
 uv run wackywacky run --config configs/full.toml
 ```
 
+Em terminal interativo, o comando usa barras `tqdm` com velocidade e ETA; quando redirecionado, grava o mesmo progresso periodicamente no `stderr`. O JSON final permanece isolado no `stdout`.
+
 Quando houver candidatos intradomínio, `run` termina com código 2 e grava a amostra privada em `work/`. Rotule cada item como `boilerplate`, `conteúdo` ou `incerto`:
+
+O CSV mantém um item por linha física, mostra quebras internas como `[QUEBRA]` e começa por `sample_id` e `frequencia`. Todo `label` começa como `boilerplate`; altere somente as exceções para `conteúdo` ou `incerto`. Prévias longas são reduzidas de forma explícita.
 
 ```bash
 uv run wackywacky review export --config configs/full.toml

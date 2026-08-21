@@ -1153,6 +1153,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "spacy" },
     { name = "tldextract" },
+    { name = "tqdm" },
     { name = "zstandard" },
 ]
 
@@ -1175,6 +1176,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "spacy", specifier = ">=3.8,<4" },
     { name = "tldextract", specifier = ">=5.3,<6" },
+    { name = "tqdm", specifier = ">=4.67,<5" },
     { name = "zstandard", specifier = ">=0.23,<1" },
 ]
 provides-extras = ["dev"]

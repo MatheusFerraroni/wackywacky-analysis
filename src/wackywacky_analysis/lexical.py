@@ -17,6 +17,7 @@ import spacy
 from .config import Config
 from .errors import WackyWackyError
 from .io import atomic_json, decode_field, iter_bounded_tsv, parse_int
+from .progress import LOGGER, ByteProgress
 from .schema import PAGES_COLUMNS
 from .storage import SortedMembership, duckdb_connection, duckdb_copy_atomic, write_parquet_atomic
 from .text import TextDecodeFailure, block_units, decode_text, paragraph_units, remove_intervals
@@ -183,15 +184,20 @@ def spacy_identity(config: Config) -> dict:
 
 
 def _clean_again(
-    config: Config, candidates: sqlite3.Connection, normalized: str, digest: str
+    config: Config,
+    candidates: sqlite3.Connection,
+    domain_id: int | None,
+    normalized: str,
 ) -> str:
+    if domain_id is None:
+        return normalized
     paragraph_intervals: list[tuple[int, int]] = []
     for start, end, unit, _text in paragraph_units(
         normalized, config.boilerplate.paragraph_min_chars
     ):
         if candidates.execute(
-            "SELECT 1 FROM candidate WHERE normalized_sha256=? AND kind='paragraph' AND digest=?",
-            (digest, unit),
+            "SELECT 1 FROM candidate WHERE domain_id=? AND kind='paragraph' AND digest=?",
+            (domain_id, unit),
         ).fetchone():
             paragraph_intervals.append((start, end))
     intervals = list(paragraph_intervals)
@@ -201,8 +207,8 @@ def _clean_again(
         if any(start < p_end and end > p_start for p_start, p_end in paragraph_intervals):
             continue
         if candidates.execute(
-            "SELECT 1 FROM candidate WHERE normalized_sha256=? AND kind='block' AND digest=?",
-            (digest, unit),
+            "SELECT 1 FROM candidate WHERE domain_id=? AND kind='block' AND digest=?",
+            (domain_id, unit),
         ).fetchone():
             intervals.append((start, end))
     return remove_intervals(normalized, intervals)[0]
@@ -285,6 +291,10 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
     document_chunk = 0
     jobs: list[tuple[int, int | None, int | None, str, tuple[str, ...]]] = []
     job_bytes = 0
+    progress = ByteProgress(
+        "Tokenização lexical",
+        manifest["sources"]["pages"]["size"],
+    )
 
     def emit(
         view: str,
@@ -354,6 +364,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
             max_line_bytes=config.runtime.max_line_bytes,
             max_rows=config.runtime.max_rows,
         ):
+            progress.update(record.end_offset, detail=f"linha {record.row_number:,}")
             if record.fields is None:
                 continue
             fields = record.fields
@@ -373,9 +384,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
             if is_d2:
                 views.append("E_exact")
             if is_d3:
-                clean = _clean_again(
-                    config, candidates, decoded.normalized, decoded.normalized_sha256
-                )
+                clean = _clean_again(config, candidates, domain, decoded.normalized)
                 if clean:
                     if clean == decoded.normalized:
                         views.append("B_clean")
@@ -383,12 +392,14 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
                         add_job(record.row_number, domain, level, clean, ("B_clean",))
             add_job(record.row_number, domain, level, decoded.normalized, tuple(views))
     flush_jobs()
+    progress.finish(detail="primeira passagem concluída")
     candidates.close()
     if documents or document_chunk == 0:
         write_parquet_atomic(
             document_dir / f"documents-{document_chunk:06d}.parquet", documents, DOCUMENT_SCHEMA
         )
     vocabulary.flush()
+    LOGGER.info("Léxico: reduzindo partições de vocabulário no DuckDB")
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
     )
@@ -449,6 +460,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         ],
         BIGRAM_CANDIDATE_SCHEMA,
     )
+    LOGGER.info("Léxico: iniciando recontagem exata dos bigramas candidatos")
     bigram_summary = recount_bigrams(
         config, root, nlp, set(bigrams.values), bigrams.omitted_upper_bound
     )
@@ -493,6 +505,7 @@ def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bou
     candidates = sqlite3.connect(f"file:{root / 'boilerplate.sqlite'}?mode=ro", uri=True)
     jobs: list[str] = []
     job_bytes = 0
+    progress = ByteProgress("Recontagem de bigramas", config.analysis_pages.stat().st_size)
 
     def flush() -> None:
         nonlocal jobs, job_bytes
@@ -522,6 +535,7 @@ def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bou
             max_line_bytes=config.runtime.max_line_bytes,
             max_rows=config.runtime.max_rows,
         ):
+            progress.update(record.end_offset, detail=f"linha {record.row_number:,}")
             if not membership.contains(record.row_number) or record.fields is None:
                 continue
             fields = record.fields
@@ -529,12 +543,14 @@ def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bou
                 decoded = decode_text(fields[13], fields[15], config.runtime.max_text_bytes)
             except TextDecodeFailure:
                 continue
-            clean = _clean_again(config, candidates, decoded.normalized, decoded.normalized_sha256)
+            domain = parse_int(fields[1])
+            clean = _clean_again(config, candidates, domain, decoded.normalized)
             jobs.append(clean)
             job_bytes += 4 * len(clean)
             if job_bytes >= config.runtime.queue_bytes or len(jobs) >= 1024:
                 flush()
     flush()
+    progress.finish(detail="segunda passagem concluída")
     candidates.close()
     rows = [
         {

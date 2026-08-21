@@ -11,7 +11,9 @@ import duckdb
 import pyarrow as pa
 
 from .config import Config
-from .io import atomic_json, iter_bounded_tsv, parse_int, read_json
+from .errors import WackyWackyError
+from .io import atomic_json, iter_bounded_tsv, parse_int, read_json, sha256_file
+from .progress import ByteProgress, ItemProgress, logged_stage
 from .schema import PAGES_COLUMNS
 from .snapshot import assert_snapshot
 from .storage import (
@@ -38,6 +40,9 @@ CLEAN_SCHEMA = pa.schema(
     ]
 )
 
+CANDIDATE_DATABASE_VERSION = 2
+CANDIDATE_BATCH_ROWS = 100_000
+
 
 def _covered_characters(intervals: list[tuple[int, int]]) -> int:
     covered = 0
@@ -50,32 +55,206 @@ def _covered_characters(intervals: list[tuple[int, int]]) -> int:
     return covered
 
 
-def _candidate_database(root: Path, enabled: bool = True) -> Path:
-    target = root / "boilerplate.sqlite"
-    if target.exists():
-        return target
-    partial = target.with_suffix(".sqlite.partial")
-    partial.unlink(missing_ok=True)
-    sql = sqlite3.connect(partial)
-    sql.execute(
-        "CREATE TABLE candidate(normalized_sha256 TEXT, kind TEXT, digest TEXT, "
-        "PRIMARY KEY(normalized_sha256, kind, digest)) WITHOUT ROWID"
+def _remove_sqlite(path: Path) -> None:
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        candidate.unlink(missing_ok=True)
+
+
+def _candidate_source_sha256(path: Path) -> str:
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    try:
+        value = sidecar.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return sha256_file(path)
+    if len(value) != 64:
+        raise WackyWackyError(f"checksum inválido em {sidecar.name}")
+    return value
+
+
+def _candidate_metadata(connection: sqlite3.Connection) -> dict[str, str]:
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != CANDIDATE_DATABASE_VERSION:
+            return {}
+        return dict(connection.execute("SELECT key, value FROM metadata"))
+    except sqlite3.DatabaseError:
+        return {}
+
+
+def _candidate_database_matches(
+    path: Path,
+    *,
+    source_sha256: str,
+    enabled: bool,
+    complete: bool,
+) -> bool:
+    if not path.exists():
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        metadata = _candidate_metadata(connection)
+        connection.close()
+    except sqlite3.DatabaseError:
+        return False
+    return (
+        metadata.get("source_sha256") == source_sha256
+        and metadata.get("enabled") == str(int(enabled))
+        and (not complete or metadata.get("complete") == "1")
     )
-    if enabled:
-        source = duckdb.connect(str(root / "analysis.duckdb"), read_only=True)
-        cursor = source.execute(
-            """
-            SELECT DISTINCT m.normalized_sha256, c.kind, c.unit_sha256
-            FROM read_parquet(?) c
-            JOIN d2_membership m USING (domain_id)
-            """,
-            [str(root / "boilerplate_candidates.parquet")],
+
+
+def _create_candidate_partial(
+    path: Path,
+    *,
+    source_sha256: str,
+    enabled: bool,
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        f"""
+        PRAGMA user_version={CANDIDATE_DATABASE_VERSION};
+        CREATE TABLE candidate(
+          domain_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          digest TEXT NOT NULL,
+          PRIMARY KEY(domain_id, kind, digest)
+        ) WITHOUT ROWID;
+        CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+        """
+    )
+    connection.executemany(
+        "INSERT INTO metadata VALUES (?, ?)",
+        (
+            ("source_sha256", source_sha256),
+            ("enabled", str(int(enabled))),
+            ("complete", "0"),
+            ("inserted", "0"),
+            ("last_domain_id", ""),
+            ("last_kind", ""),
+            ("last_digest", ""),
+        ),
+    )
+    connection.commit()
+    return connection
+
+
+def _candidate_database(config: Config, root: Path) -> Path:
+    target = root / "boilerplate.sqlite"
+    source_path = root / "boilerplate_candidates.parquet"
+    source_sha256 = _candidate_source_sha256(source_path)
+    enabled = config.boilerplate.enabled
+    if _candidate_database_matches(
+        target,
+        source_sha256=source_sha256,
+        enabled=enabled,
+        complete=True,
+    ):
+        return target
+    _remove_sqlite(target)
+    partial = target.with_suffix(".sqlite.partial")
+    if not _candidate_database_matches(
+        partial,
+        source_sha256=source_sha256,
+        enabled=enabled,
+        complete=False,
+    ):
+        _remove_sqlite(partial)
+    sql = (
+        sqlite3.connect(partial)
+        if partial.exists()
+        else _create_candidate_partial(
+            partial,
+            source_sha256=source_sha256,
+            enabled=enabled,
         )
-        while batch := cursor.fetchmany(100_000):
-            sql.executemany("INSERT INTO candidate VALUES (?, ?, ?)", batch)
-            sql.commit()
+    )
+    metadata = _candidate_metadata(sql)
+    if metadata.get("complete") == "1":
+        sql.close()
+        os.replace(partial, target)
+        return target
+
+    source = duckdb.connect()
+    source.execute("SET memory_limit = ?", [config.runtime.memory_limit])
+    temp_directory = root / "duckdb-tmp"
+    temp_directory.mkdir(parents=True, exist_ok=True)
+    source.execute("SET temp_directory = ?", [str(temp_directory)])
+    unique_candidates = """
+        SELECT domain_id, kind, unit_sha256
+        FROM read_parquet(?)
+        WHERE domain_id IS NOT NULL
+        GROUP BY domain_id, kind, unit_sha256
+    """
+    total = (
+        source.execute(
+            f"SELECT count(*) FROM ({unique_candidates})", [str(source_path)]
+        ).fetchone()[0]
+        if enabled
+        else 0
+    )
+    inserted = int(metadata.get("inserted", "0"))
+    actual = sql.execute("SELECT count(*) FROM candidate").fetchone()[0]
+    if actual != inserted:
+        sql.close()
         source.close()
-    sql.close()
+        _remove_sqlite(partial)
+        return _candidate_database(config, root)
+    progress = ItemProgress("[6.1/3] Índice de candidatos", total, initial=inserted)
+    try:
+        if enabled:
+            parameters: list[object] = [str(source_path)]
+            remaining = unique_candidates
+            if inserted:
+                last_domain_id = int(metadata["last_domain_id"])
+                last_kind = metadata["last_kind"]
+                last_digest = metadata["last_digest"]
+                remaining += """
+                    HAVING domain_id > ?
+                       OR (domain_id = ? AND kind > ?)
+                       OR (domain_id = ? AND kind = ? AND unit_sha256 > ?)
+                """
+                parameters.extend(
+                    [
+                        last_domain_id,
+                        last_domain_id,
+                        last_kind,
+                        last_domain_id,
+                        last_kind,
+                        last_digest,
+                    ]
+                )
+            cursor = source.execute(
+                f"SELECT * FROM ({remaining}) ORDER BY domain_id, kind, unit_sha256", parameters
+            )
+            while batch := cursor.fetchmany(CANDIDATE_BATCH_ROWS):
+                sql.executemany("INSERT INTO candidate VALUES (?, ?, ?)", batch)
+                inserted += len(batch)
+                last_domain_id, last_kind, last_digest = batch[-1]
+                sql.executemany(
+                    "UPDATE metadata SET value=? WHERE key=?",
+                    (
+                        (str(inserted), "inserted"),
+                        (str(last_domain_id), "last_domain_id"),
+                        (last_kind, "last_kind"),
+                        (last_digest, "last_digest"),
+                    ),
+                )
+                sql.commit()
+                progress.update(inserted)
+        if inserted != total:
+            raise WackyWackyError(
+                f"índice de candidatos incompleto: {inserted} de {total} registros"
+            )
+        sql.execute("UPDATE metadata SET value='1' WHERE key='complete'")
+        sql.commit()
+    except BaseException:
+        progress.close()
+        raise
+    else:
+        progress.finish()
+    finally:
+        source.close()
+        sql.close()
     os.replace(partial, target)
     return target
 
@@ -84,7 +263,7 @@ def clean_representatives(config: Config, manifest: dict, root: Path) -> dict:
     summary_path = root / "clean_summary.json"
     if summary_path.exists():
         return json.loads(summary_path.read_text(encoding="utf-8"))
-    candidate_db = _candidate_database(root, config.boilerplate.enabled)
+    candidate_db = _candidate_database(config, root)
     candidates = sqlite3.connect(f"file:{candidate_db}?mode=ro", uri=True)
     output_dir = root / "clean" / "chunks"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -102,6 +281,11 @@ def clean_representatives(config: Config, manifest: dict, root: Path) -> dict:
     paragraph_characters = int(state.get("paragraph_characters", 0))
     block_characters = int(state.get("block_characters", 0))
     membership = SortedMembership(root / "d2_representatives.u64")
+    progress = ByteProgress(
+        "[6.2/3] Limpeza B_clean",
+        manifest["sources"]["pages"]["size"],
+        initial=offset,
+    )
     stop = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -165,48 +349,53 @@ def clean_representatives(config: Config, manifest: dict, root: Path) -> dict:
                     ),
                 }
                 atomic_json(state_path, state)
+                progress.update(offset, detail=f"{scanned:,} representantes D2 processados")
                 if stop:
+                    progress.close()
                     candidates.close()
                     return {"complete": False, "stage": "clean"}
             state["complete"] = True
             atomic_json(state_path, state)
+            progress.finish(detail=f"{scanned:,} representantes D2 processados")
     finally:
         signal.signal(signal.SIGTERM, previous_term)
     candidates.close()
-    clean_glob = str(output_dir / "*.parquet").replace("'", "''")
-    connection = duckdb_connection(
-        root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
-    )
-    connection.execute(
-        f"CREATE OR REPLACE VIEW clean_features AS SELECT * FROM read_parquet('{clean_glob}')"
-    )
-    connection.execute(
-        """
-        CREATE OR REPLACE TABLE d3_membership AS
-        SELECT *, row_number() OVER (
-          PARTITION BY clean_sha256 ORDER BY page_id IS NULL, page_id, row_number
-        ) = 1 AS is_representative
-        FROM clean_features WHERE NOT empty
-        """
-    )
-    duckdb_copy_atomic(
-        connection,
-        """
-        SELECT clean_sha256, count(*) AS documents, count(DISTINCT domain_id) AS domains,
-               min(row_number) FILTER (WHERE is_representative) AS representative_row
-        FROM d3_membership GROUP BY clean_sha256
-        """,
-        root / "d3_groups.parquet",
-    )
-    rep_rows = connection.execute(
-        "SELECT row_number FROM d3_membership WHERE is_representative ORDER BY row_number"
-    ).fetchall()
-    write_u64(root / "d3_representatives.u64", (row[0] for row in rep_rows))
-    d3_unique = len(rep_rows)
-    d3_groups = connection.execute(
-        "SELECT count(*) FROM (SELECT clean_sha256 FROM d3_membership GROUP BY 1 HAVING count(*) > 1)"
-    ).fetchone()[0]
-    connection.close()
+    with logged_stage("[6.3/3] Deduplicação D3"):
+        clean_glob = str(output_dir / "*.parquet").replace("'", "''")
+        connection = duckdb_connection(
+            root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
+        )
+        connection.execute(
+            f"CREATE OR REPLACE VIEW clean_features AS SELECT * FROM read_parquet('{clean_glob}')"
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TABLE d3_membership AS
+            SELECT *, row_number() OVER (
+              PARTITION BY clean_sha256 ORDER BY page_id IS NULL, page_id, row_number
+            ) = 1 AS is_representative
+            FROM clean_features WHERE NOT empty
+            """
+        )
+        duckdb_copy_atomic(
+            connection,
+            """
+            SELECT clean_sha256, count(*) AS documents, count(DISTINCT domain_id) AS domains,
+                   min(row_number) FILTER (WHERE is_representative) AS representative_row
+            FROM d3_membership GROUP BY clean_sha256
+            """,
+            root / "d3_groups.parquet",
+        )
+        rep_rows = connection.execute(
+            "SELECT row_number FROM d3_membership WHERE is_representative ORDER BY row_number"
+        ).fetchall()
+        write_u64(root / "d3_representatives.u64", (row[0] for row in rep_rows))
+        d3_unique = len(rep_rows)
+        d3_groups = connection.execute(
+            "SELECT count(*) FROM (SELECT clean_sha256 FROM d3_membership "
+            "GROUP BY 1 HAVING count(*) > 1)"
+        ).fetchone()[0]
+        connection.close()
     summary = {
         "d2_representatives": scanned,
         "documents_affected": affected,
@@ -241,9 +430,8 @@ def _clean_record(
             decoded.normalized, config.boilerplate.paragraph_min_chars
         ):
             if candidates.execute(
-                "SELECT 1 FROM candidate WHERE normalized_sha256=? "
-                "AND kind='paragraph' AND digest=?",
-                (decoded.normalized_sha256, digest),
+                "SELECT 1 FROM candidate WHERE domain_id=? AND kind='paragraph' AND digest=?",
+                (domain_id, digest),
             ).fetchone():
                 paragraph_intervals.append((start, end))
         intervals.extend(paragraph_intervals)
@@ -255,8 +443,8 @@ def _clean_record(
             if any(start < p_end and end > p_start for p_start, p_end in paragraph_intervals):
                 continue
             if candidates.execute(
-                "SELECT 1 FROM candidate WHERE normalized_sha256=? AND kind='block' AND digest=?",
-                (decoded.normalized_sha256, digest),
+                "SELECT 1 FROM candidate WHERE domain_id=? AND kind='block' AND digest=?",
+                (domain_id, digest),
             ).fetchone():
                 block_intervals.append((start, end))
         intervals.extend(block_intervals)

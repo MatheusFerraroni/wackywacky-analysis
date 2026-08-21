@@ -101,9 +101,9 @@ def test_source_change_invalidates_sample_and_verify_hashes_only_derived_files(
     inputs = analysis_paths(config)
     hashed: list[Path] = []
 
-    def recording_sha(path: Path) -> str:
+    def recording_sha(path: Path, **kwargs) -> str:
         hashed.append(path)
-        return sha256_file(path)
+        return sha256_file(path, **kwargs)
 
     monkeypatch.setattr("wackywacky_analysis.snapshot.sha256_file", recording_sha)
     manifest = verify_snapshot(config)

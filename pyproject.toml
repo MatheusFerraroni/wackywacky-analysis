@@ -14,6 +14,7 @@ dependencies = [
   "numpy>=2.0,<3",
   "pyarrow>=21,<27",
   "spacy>=3.8,<4",
+  "tqdm>=4.67,<5",
   "pt-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.8.0/pt_core_news_sm-3.8.0-py3-none-any.whl",
   "tldextract>=5.3,<6",
   "zstandard>=0.23,<1",

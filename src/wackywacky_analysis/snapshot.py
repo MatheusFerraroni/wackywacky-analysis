@@ -7,6 +7,7 @@ from typing import Any
 from .config import Config
 from .errors import SourceChangedError, WackyWackyError
 from .io import atomic_json, sha256_file
+from .progress import ByteProgress
 from .sampling import analysis_paths
 from .schema import DOMAIN_COLUMNS, PAGES_COLUMNS
 
@@ -52,8 +53,12 @@ def verify_snapshot(config: Config, *, persist: bool = True) -> dict[str, Any]:
         "pages": inputs.pages.stat(),
         "domains": inputs.domains.stat(),
     }
-    pages_sha = sha256_file(inputs.pages)
-    domains_sha = sha256_file(inputs.domains)
+    pages_progress = ByteProgress("SHA-256 de pages.tsv", before["pages"].st_size)
+    pages_sha = sha256_file(inputs.pages, progress=pages_progress.update)
+    pages_progress.finish()
+    domains_progress = ByteProgress("SHA-256 de domain.tsv", before["domains"].st_size)
+    domains_sha = sha256_file(inputs.domains, progress=domains_progress.update)
+    domains_progress.finish()
     after = {
         "pages": inputs.pages.stat(),
         "domains": inputs.domains.stat(),

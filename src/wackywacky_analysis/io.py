@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -69,11 +69,19 @@ def parse_int(value: bytes) -> int | None:
         return None
 
 
-def sha256_file(path: Path, block_bytes: int = 8 * 1024 * 1024) -> str:
+def sha256_file(
+    path: Path,
+    block_bytes: int = 8 * 1024 * 1024,
+    progress: Callable[[int], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
+    processed = 0
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(block_bytes), b""):
             digest.update(block)
+            processed += len(block)
+            if progress is not None:
+                progress(processed)
     return digest.hexdigest()
 
 

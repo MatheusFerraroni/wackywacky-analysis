@@ -9,6 +9,7 @@ from .errors import SourceChangedError, WackyWackyError
 from .io import atomic_json, read_json
 from .lexical import lexical_pass
 from .pages import scan_pages
+from .progress import logged_stage
 from .reduction import reduce_exact
 from .reports import build_reports, write_checksums
 from .review import require_approved_review
@@ -26,7 +27,8 @@ def _stage(state_path: Path, state: dict, name: str) -> None:
 
 
 def run_pipeline(config: Config, *, resume: bool) -> dict:
-    manifest = verify_snapshot(config)
+    with logged_stage("[1/11] Identidade do snapshot"):
+        manifest = verify_snapshot(config)
     if resume:
         for previous_path in config.paths.work.glob("*/manifest.json"):
             previous = read_json(previous_path, {})
@@ -55,36 +57,46 @@ def run_pipeline(config: Config, *, resume: bool) -> dict:
         "stage": "verified",
     }
     atomic_json(state_path, state)
-    domain_summary = inventory_domains(config, manifest, root)
-    assert_snapshot(config, manifest)
+    with logged_stage("[2/11] Inventário de domínios"):
+        domain_summary = inventory_domains(config, manifest, root)
+        assert_snapshot(config, manifest)
     _stage(state_path, state, "domains")
-    scan = scan_pages(config, manifest, root, resume=resume)
+    with logged_stage("[3/11] Leitura e validação de páginas"):
+        scan = scan_pages(config, manifest, root, resume=resume)
     if not scan.get("complete"):
         _stage(state_path, state, "interrupted")
         return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
     _stage(state_path, state, "pages")
-    exact = reduce_exact(config, root)
-    assert_snapshot(config, manifest)
+    with logged_stage("[4/11] Deduplicação exata D1/D2"):
+        exact = reduce_exact(config, root)
+        assert_snapshot(config, manifest)
     _stage(state_path, state, "exact")
-    gate = require_approved_review(config, root)
+    with logged_stage("[5/11] Gate da revisão privada"):
+        gate = require_approved_review(config, root)
     state["review_gate"] = gate
     _stage(state_path, state, "review_approved")
-    clean = clean_representatives(config, manifest, root)
+    with logged_stage("[6/11] Limpeza e deduplicação D3"):
+        clean = clean_representatives(config, manifest, root)
     if clean.get("complete") is False:
         _stage(state_path, state, "interrupted")
         return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
     assert_snapshot(config, manifest)
     _stage(state_path, state, "clean")
-    lexical = lexical_pass(config, manifest, root)
-    assert_snapshot(config, manifest)
+    with logged_stage("[7/11] Estatísticas lexicais"):
+        lexical = lexical_pass(config, manifest, root)
+        assert_snapshot(config, manifest)
     _stage(state_path, state, "lexical")
-    validate_invariants(exact, clean, lexical, root)
+    with logged_stage("[8/11] Validação de invariantes"):
+        validate_invariants(exact, clean, lexical, root)
     _stage(state_path, state, "validated")
-    result = build_reports(config, manifest, domain_summary, exact, clean, lexical, root)
+    with logged_stage("[9/11] Tabelas e agregados"):
+        result = build_reports(config, manifest, domain_summary, exact, clean, lexical, root)
     from .render import render_all
 
-    render_all(result)
-    write_checksums(result)
+    with logged_stage("[10/11] Figuras"):
+        render_all(result)
+    with logged_stage("[11/11] Checksums finais"):
+        write_checksums(result)
     state["result"] = str(result)
     _stage(state_path, state, "complete")
     return {

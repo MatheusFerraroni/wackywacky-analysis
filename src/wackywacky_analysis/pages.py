@@ -8,6 +8,7 @@ import pyarrow as pa
 
 from .config import Config
 from .io import atomic_json, decode_field, is_null, iter_bounded_tsv, parse_int, read_json
+from .progress import ByteProgress
 from .schema import PAGES_COLUMNS
 from .snapshot import assert_snapshot
 from .storage import write_parquet_atomic
@@ -92,6 +93,11 @@ def scan_pages(config: Config, manifest: dict, root: Path, *, resume: bool) -> d
     chunk_index = int(scan.get("next_chunk", 0))
     if offset and not resume:
         raise ValueError("estado parcial existe; use --resume")
+    progress = ByteProgress(
+        "Páginas",
+        manifest["sources"]["pages"]["size"],
+        initial=offset,
+    )
     stop = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -159,6 +165,10 @@ def scan_pages(config: Config, manifest: dict, root: Path, *, resume: bool) -> d
                 state["config_sha256"] = config.fingerprint
                 state["pages_scan"] = scan
                 atomic_json(state_path, state)
+                progress.update(
+                    offset,
+                    detail=f"linha {row_number:,}; {chunk_index:,} chunks confirmados",
+                )
                 if stop:
                     break
                 if config.runtime.max_rows and row_number >= config.runtime.max_rows:
@@ -169,6 +179,8 @@ def scan_pages(config: Config, manifest: dict, root: Path, *, resume: bool) -> d
                     break
             state["pages_scan"] = scan
             atomic_json(state_path, state)
+            if scan.get("complete"):
+                progress.finish(detail=f"linha {row_number:,}; {chunk_index:,} chunks confirmados")
     finally:
         signal.signal(signal.SIGTERM, previous_term)
     return scan

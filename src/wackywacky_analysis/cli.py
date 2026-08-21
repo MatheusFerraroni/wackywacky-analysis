@@ -10,6 +10,7 @@ from .errors import ReviewRequired, WackyWackyError
 from .io import atomic_json
 from .near import run_near_duplicates
 from .pipeline import locate_result, locate_root, run_pipeline
+from .progress import configure_logging
 from .reports import write_checksums, write_table
 from .review import export_review, import_review
 from .sampling import create_sample
@@ -48,6 +49,7 @@ def _print(value: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    configure_logging()
     try:
         config = load_config(arguments.config)
         if arguments.command == "sample":
@@ -85,7 +87,13 @@ def main(argv: list[str] | None = None) -> int:
                 _print(
                     {"status": "not_needed"}
                     if output is None
-                    else {"status": "exported", "path": str(output)}
+                    else {
+                        "status": "exported",
+                        "path": str(output),
+                        "instruction": (
+                            "labels começam como boilerplate; altere somente conteúdo e incerto"
+                        ),
+                    }
                 )
             else:
                 _print(import_review(config, root, Path(arguments.input).resolve()))

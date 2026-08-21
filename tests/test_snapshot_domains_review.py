@@ -10,7 +10,7 @@ from wackywacky_analysis.domains import inventory_domains
 from wackywacky_analysis.errors import SourceChangedError
 from wackywacky_analysis.io import atomic_json
 from wackywacky_analysis.pipeline import run_pipeline
-from wackywacky_analysis.review import wilson_lower
+from wackywacky_analysis.review import _review_preview, wilson_lower
 from wackywacky_analysis.snapshot import assert_snapshot, verify_snapshot
 
 
@@ -81,3 +81,13 @@ def test_headerless_sources_are_validated_by_column_count(tmp_path: Path) -> Non
 def test_wilson_gate_requires_enough_correct_reviews() -> None:
     assert wilson_lower(190, 200) > 0.90
     assert wilson_lower(189, 200) < wilson_lower(190, 200)
+
+
+def test_review_preview_is_single_line_clean_and_bounded() -> None:
+    preview, truncated = _review_preview("linha 1\nlinha\u200b 2\x00")
+    assert preview == "linha 1 [QUEBRA] linha 2"
+    assert truncated is False
+    preview, truncated = _review_preview("a" * 5_000, limit=100)
+    assert truncated is True
+    assert "caracteres omitidos" in preview
+    assert len(preview) < 130
