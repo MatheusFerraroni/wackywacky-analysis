@@ -206,6 +206,26 @@ bigram_candidates = 1000
 published_items = 100
 figure_items = 30
 
+[content]
+enabled = true
+mattr_window = 5
+fragment_max_words = 2
+long_sentence_words = 20
+long_token_chars = 30
+punctuation_run = 4
+repetition_sentence_min_words = 3
+repetition_paragraph_min_chars = 20
+high_numeric_fraction = 0.30
+high_nonlexical_fraction = 0.30
+high_uppercase_fraction = 0.50
+fraction_min_tokens = 5
+domain_min_documents = 2
+domain_limit = 10
+collocation_min_frequency = 2
+collocation_min_documents = 1
+trigram_candidates = 1000
+vocabulary_seed = 73129
+
 [near_duplicates]
 enabled = false
 minimum_words = 5

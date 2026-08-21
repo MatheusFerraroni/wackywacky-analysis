@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -53,6 +54,7 @@ def build_reports(
     exact: dict,
     clean: dict,
     lexical: dict,
+    content: dict,
     root: Path,
 ) -> Path:
     result = config.paths.results / manifest["snapshot_id"]
@@ -96,10 +98,13 @@ def build_reports(
             "source": config.public_dict()["source"],
             "boilerplate": config.public_dict()["boilerplate"],
             "lexical": config.public_dict()["lexical"],
+            "content": config.public_dict()["content"],
             "near_duplicates": config.public_dict()["near_duplicates"],
             "sampling": config.public_dict()["sampling"],
         },
         "spacy": lexical["spacy"],
+        "content_spacy": content.get("spacy"),
+        "content_config_sha256": config.content_fingerprint,
         "review_gate": review_gate,
         "invariants": invariants,
     }
@@ -111,6 +116,7 @@ def build_reports(
         "exact": exact,
         "clean": clean,
         "lexical": lexical,
+        "content": content,
         "review_gate": review_gate,
         "invariants": invariants,
     }
@@ -314,8 +320,466 @@ def build_reports(
         ["item", "frequencia"],
         (row[:2] for row in top_bigrams[: config.lexical.figure_items]),
     )
+    if content.get("status") == "complete":
+        _content_tables(
+            connection,
+            config,
+            content,
+            root,
+            tables,
+            figures_data,
+            sampled=sampled,
+        )
     connection.close()
     return result
+
+
+def _weighted_histogram_summary(connection, root: Path) -> list[tuple]:
+    return connection.execute(
+        """
+        WITH base AS (
+          SELECT metric, value, count,
+                 sum(count) OVER(PARTITION BY metric ORDER BY value) cumulative,
+                 sum(count) OVER(PARTITION BY metric) total
+          FROM read_parquet(?)
+        )
+        SELECT metric, max(total) units, sum(value*count)/max(total) mean,
+               min(value) FILTER (WHERE cumulative >= total*0.05) p5,
+               min(value) FILTER (WHERE cumulative >= total*0.25) p25,
+               min(value) FILTER (WHERE cumulative >= total*0.50) p50,
+               min(value) FILTER (WHERE cumulative >= total*0.75) p75,
+               min(value) FILTER (WHERE cumulative >= total*0.95) p95,
+               min(value) FILTER (WHERE cumulative >= total*0.99) p99
+        FROM base GROUP BY metric ORDER BY metric
+        """,
+        [str(root / "content_histograms.parquet")],
+    ).fetchall()
+
+
+def _metric_quantiles(connection, expression: str, *, where: str = "true") -> tuple:
+    return connection.execute(
+        f"""
+        SELECT count({expression}), avg({expression}),
+               quantile_cont({expression}, [0.05,0.25,0.5,0.75,0.95,0.99])
+        FROM content_document_statistics WHERE {where}
+        """
+    ).fetchone()
+
+
+def _vocabulary_curves(connection, config: Config, root: Path) -> list[tuple]:
+    documents = connection.execute("SELECT count(*) FROM content_document_statistics").fetchone()[0]
+    if not documents:
+        return []
+    checkpoints: set[int] = {documents} if documents else set()
+    for percentage in range(1, 101):
+        checkpoints.add(max(1, math.ceil(documents * percentage / 100)))
+    scale = 1
+    while scale <= documents:
+        checkpoints.update(value for value in (scale, 2 * scale, 5 * scale) if value <= documents)
+        scale *= 10
+    ordered_checkpoints = sorted(checkpoints)
+    total_types = dict(
+        connection.execute(
+            "SELECT kind, count(*) FROM read_parquet(?) GROUP BY kind",
+            [str(root / "content_vocabulary_first.parquet")],
+        ).fetchall()
+    )
+    cursor = connection.execute(
+        """
+        WITH ranked_documents AS (
+          SELECT priority, row_number() OVER(ORDER BY priority, row_number) document_rank
+          FROM content_document_statistics
+        ), first_ranks AS (
+          SELECT v.kind, d.document_rank, count(*) new_types
+          FROM read_parquet(?) v JOIN ranked_documents d ON v.first_priority=d.priority
+          GROUP BY v.kind, d.document_rank
+        )
+        SELECT kind, document_rank, new_types FROM first_ranks ORDER BY kind, document_rank
+        """,
+        [str(root / "content_vocabulary_first.parquet")],
+    )
+    curve: list[tuple] = []
+    current_kind: str | None = None
+    cumulative = checkpoint_index = 0
+
+    def finish_kind(kind: str | None) -> None:
+        nonlocal checkpoint_index
+        if kind is None:
+            return
+        while checkpoint_index < len(ordered_checkpoints):
+            checkpoint = ordered_checkpoints[checkpoint_index]
+            curve.append(
+                (
+                    "documentos_aleatorios",
+                    kind,
+                    checkpoint,
+                    cumulative,
+                    total_types[kind],
+                    cumulative / total_types[kind] if total_types[kind] else 0,
+                )
+            )
+            checkpoint_index += 1
+
+    while batch := cursor.fetchmany(100_000):
+        for kind, rank, new_types in batch:
+            if kind != current_kind:
+                finish_kind(current_kind)
+                current_kind = kind
+                cumulative = 0
+                checkpoint_index = 0
+            while (
+                checkpoint_index < len(ordered_checkpoints)
+                and ordered_checkpoints[checkpoint_index] < rank
+            ):
+                checkpoint = ordered_checkpoints[checkpoint_index]
+                curve.append(
+                    (
+                        "documentos_aleatorios",
+                        kind,
+                        checkpoint,
+                        cumulative,
+                        total_types[kind],
+                        cumulative / total_types[kind] if total_types[kind] else 0,
+                    )
+                )
+                checkpoint_index += 1
+            cumulative += new_types
+    finish_kind(current_kind)
+    if any(row[3] != row[4] for row in curve if row[2] == documents):
+        raise ValueError("curva de acumulação não termina no vocabulário exato")
+    for kind in ("form", "lemma"):
+        frequencies = connection.execute(
+            """
+            SELECT total_frequency FROM read_parquet(?)
+            WHERE view='B_clean' AND kind=? ORDER BY total_frequency DESC, term
+            """,
+            [str(root / "vocabulary.parquet"), kind],
+        ).fetchall()
+        total = sum(row[0] for row in frequencies)
+        running = 0
+        requested = {10, 100, 1_000, 10_000, 50_000}
+        for rank, (frequency,) in enumerate(frequencies, 1):
+            running += frequency
+            if rank in requested or rank == len(frequencies):
+                curve.append(
+                    (
+                        "top_termos",
+                        kind,
+                        rank,
+                        running,
+                        total,
+                        running / total if total else 0,
+                    )
+                )
+    return curve
+
+
+def _content_tables(
+    connection,
+    config: Config,
+    content: dict,
+    root: Path,
+    tables: Path,
+    aggregates: Path,
+    *,
+    sampled: bool,
+) -> None:
+    histogram_summary = _weighted_histogram_summary(connection, root)
+    write_table(
+        tables,
+        "14_estrutura_sentencas_paragrafos",
+        ["metrica", "unidades", "media", "p5", "p25", "p50", "p75", "p95", "p99"],
+        histogram_summary,
+    )
+    write_table(
+        aggregates,
+        "estrutura_textual",
+        ["metrica", "valor", "unidades"],
+        connection.execute(
+            "SELECT metric, value, count FROM read_parquet(?) ORDER BY metric, value",
+            [str(root / "content_histograms.parquet")],
+        ).fetchall(),
+    )
+
+    diversity_rows = []
+    for label, expression, where in (
+        ("formas_unicas", "unique_forms", "true"),
+        ("lemas_unicos", "unique_lemmas", "true"),
+        ("hapax_local_por_palavra", "local_hapax/nullif(words,0)", "words>0"),
+        ("TTR", "ttr", "words>0"),
+        ("MATTR", "mattr", "mattr IS NOT NULL"),
+    ):
+        count, mean, quantiles = _metric_quantiles(connection, expression, where=where)
+        diversity_rows.append((label, count, mean, *(quantiles or [None] * 6)))
+    size_rows = connection.execute(
+        """
+        SELECT CASE WHEN words<100 THEN '0-99' WHEN words<500 THEN '100-499'
+                    WHEN words<2000 THEN '500-1999' ELSE '2000+' END faixa_palavras,
+               count(*), avg(ttr), quantile_cont(ttr,0.5)
+        FROM content_document_statistics GROUP BY 1
+        ORDER BY min(words)
+        """
+    ).fetchall()
+    write_table(
+        tables,
+        "15_diversidade_lexical_documental",
+        ["metrica", "documentos", "media", "p5", "p25", "p50", "p75", "p95", "p99"],
+        diversity_rows,
+    )
+    write_table(
+        tables,
+        "15b_ttr_por_tamanho",
+        ["faixa_palavras", "documentos", "TTR_media", "TTR_mediana"],
+        size_rows,
+    )
+    diversity_distribution = connection.execute(
+        """
+        SELECT metric, metric_value, count(*) documents FROM (
+          SELECT 'TTR' metric, round(ttr,4) AS metric_value
+          FROM content_document_statistics WHERE words>0
+          UNION ALL
+          SELECT 'MATTR', round(mattr,4) FROM content_document_statistics WHERE mattr IS NOT NULL
+        ) GROUP BY metric, metric_value ORDER BY metric, metric_value
+        """
+    ).fetchall()
+    write_table(
+        aggregates,
+        "diversidade_lexical",
+        ["metrica", "valor", "documentos"],
+        diversity_distribution,
+    )
+
+    grammar_rows = connection.execute(
+        """
+        SELECT kind, feature, value, count,
+               count/sum(count) OVER(PARTITION BY kind, feature) AS participation
+        FROM read_parquet(?) ORDER BY kind, feature, count DESC, value
+        """,
+        [str(root / "content_grammar.parquet")],
+    ).fetchall()
+    lexical_density = _metric_quantiles(connection, "lexical_density", where="words>0")
+    grammar_rows.append(("derived", "densidade_lexical", "media", lexical_density[1], None))
+    write_table(
+        tables,
+        "16_pos_morfologia",
+        ["tipo", "feature", "valor", "total", "participacao"],
+        grammar_rows,
+    )
+    write_table(
+        aggregates,
+        "classes_gramaticais",
+        ["classe", "total", "participacao"],
+        ((row[2], row[3], row[4]) for row in grammar_rows if row[0] == "pos"),
+    )
+
+    repetition_rows = []
+    for label, expression, affected_threshold in (
+        ("fracao_palavras_frases_repetidas", "repeated_sentence_fraction", 0),
+        ("fracao_palavras_paragrafos_repetidos", "repeated_paragraph_fraction", 0),
+        ("maior_sequencia_frases_identicas", "max_sentence_run", 1),
+        ("maior_sequencia_paragrafos_identicos", "max_paragraph_run", 1),
+    ):
+        count, mean, quantiles = _metric_quantiles(connection, expression)
+        affected = connection.execute(
+            f"SELECT count(*) FROM content_document_statistics WHERE {expression}>?",
+            [affected_threshold],
+        ).fetchone()[0]
+        repetition_rows.append((label, count, affected, mean, *(quantiles or [None] * 6)))
+    write_table(
+        tables,
+        "17_repeticao_interna",
+        [
+            "metrica",
+            "documentos",
+            "documentos_afetados",
+            "media",
+            "p5",
+            "p25",
+            "p50",
+            "p75",
+            "p95",
+            "p99",
+        ],
+        repetition_rows,
+    )
+    repetition_distribution = connection.execute(
+        """
+        SELECT metric, metric_value, count(*) documents FROM (
+          SELECT 'frases' metric, round(repeated_sentence_fraction,4) AS metric_value
+          FROM content_document_statistics
+          UNION ALL
+          SELECT 'paragrafos', round(repeated_paragraph_fraction,4)
+          FROM content_document_statistics
+        ) GROUP BY metric, metric_value ORDER BY metric, metric_value
+        """
+    ).fetchall()
+    write_table(
+        aggregates,
+        "repeticao_interna",
+        ["unidade", "fracao", "documentos"],
+        repetition_distribution,
+    )
+
+    signal_columns = (
+        ("frases_fragmentadas", "fragment_sentences"),
+        ("frases_longas", "long_sentences"),
+        ("tokens_longos", "long_tokens"),
+        ("URLs_no_texto", "urls"),
+        ("emails_no_texto", "emails"),
+        ("sequencias_pontuacao", "punctuation_runs"),
+        ("marcadores_mojibake", "mojibake_markers"),
+        ("alta_fracao_numerica", "high_numeric::INTEGER"),
+        ("alta_fracao_nao_lexical", "high_nonlexical::INTEGER"),
+        ("alta_fracao_caixa_alta", "high_uppercase::INTEGER"),
+    )
+    documents = content["metrics"]["documents"]
+    signal_rows = []
+    for label, expression in signal_columns:
+        occurrences, affected = connection.execute(
+            f"SELECT sum({expression}), count(*) FILTER (WHERE {expression}>0) FROM content_document_statistics"
+        ).fetchone()
+        signal_rows.append(
+            (label, occurrences or 0, affected, affected / documents if documents else 0, documents)
+        )
+    write_table(
+        tables,
+        "18_sinais_textuais",
+        ["indicador", "ocorrencias", "documentos", "participacao_documentos", "denominador"],
+        signal_rows,
+    )
+    write_table(
+        aggregates,
+        "sinais_textuais",
+        ["indicador", "documentos", "participacao"],
+        ((row[0], row[2], row[3]) for row in signal_rows),
+    )
+
+    bigram_floor = max(
+        config.content.collocation_min_frequency,
+        int(json.loads((root / "bigram_candidates.json").read_text())["omitted_upper_bound"]) + 1,
+    )
+    bigram_rows = connection.execute(
+        """
+        WITH scored AS (
+          SELECT replace(b.bigram, chr(9), ' ') item, b.total_frequency, b.document_frequency,
+                 ln((b.total_frequency::DOUBLE*?)/
+                    (l.left_count::DOUBLE*r.right_count::DOUBLE)) pmi,
+                 ln((b.total_frequency::DOUBLE*?)/
+                    (l.left_count::DOUBLE*r.right_count::DOUBLE)) /
+                    -ln(b.total_frequency::DOUBLE/?) npmi
+          FROM read_parquet(?) b
+          JOIN read_parquet(?) l ON l.term=split_part(b.bigram,chr(9),1)
+          JOIN read_parquet(?) r ON r.term=split_part(b.bigram,chr(9),2)
+          WHERE NOT b.contains_stopword AND b.total_frequency>=? AND b.document_frequency>=?
+        )
+        SELECT * FROM scored ORDER BY npmi DESC, total_frequency DESC, item LIMIT ?
+        """,
+        [
+            content["metrics"]["bigram_positions"],
+            content["metrics"]["bigram_positions"],
+            content["metrics"]["bigram_positions"],
+            str(root / "bigrams.parquet"),
+            str(root / "content_bigram_marginals.parquet"),
+            str(root / "content_bigram_marginals.parquet"),
+            bigram_floor,
+            config.content.collocation_min_documents,
+            config.lexical.published_items,
+        ],
+    ).fetchall()
+    trigram_floor = content["trigrams"]["eligible_frequency_floor"]
+    trigram_rows = connection.execute(
+        """
+        SELECT replace(trigram, chr(9), ' ') item, total_frequency, document_frequency
+        FROM read_parquet(?)
+        WHERE NOT contains_stopword_at_edges AND total_frequency>=? AND document_frequency>=?
+        ORDER BY total_frequency DESC, item LIMIT ?
+        """,
+        [
+            str(root / "content_trigrams.parquet"),
+            trigram_floor,
+            config.content.collocation_min_documents,
+            config.lexical.published_items,
+        ],
+    ).fetchall()
+    collocation_rows = [
+        ("bigrama_NPMI", *row) for row in bigram_rows
+    ] + [("trigrama_frequente", *row, None, None) for row in trigram_rows]
+    write_table(
+        tables,
+        "19_colocacoes",
+        ["ranking", "item", "frequencia", "documentos", "PMI", "NPMI"],
+        collocation_rows,
+    )
+    write_table(
+        aggregates,
+        "colocacoes",
+        ["ranking", "item", "frequencia", "NPMI"],
+        (
+            (row[0], row[1], row[2], row[5])
+            for row in (
+                [("bigrama_NPMI", *item) for item in bigram_rows[: config.lexical.figure_items]]
+                + [
+                    ("trigrama_frequente", *item, None, None)
+                    for item in trigram_rows[: config.lexical.figure_items]
+                ]
+            )
+        ),
+    )
+
+    domains = connection.execute(
+        """
+        SELECT d.host, count(*) documents, sum(c.words) words,
+               quantile_cont(c.words,0.5) median_words,
+               quantile_cont(c.words/nullif(c.sentences,0),0.5) median_words_sentence,
+               quantile_cont(c.paragraphs,0.5) median_paragraphs,
+               quantile_cont(c.mattr,0.5) median_mattr,
+               quantile_cont(c.lexical_density,0.5) median_lexical_density,
+               avg(c.repeated_paragraph_fraction) mean_paragraph_repetition,
+               avg(c.any_signal::INTEGER) signal_prevalence
+        FROM content_document_statistics c JOIN canonical_domains d ON c.domain_id=d.id
+        GROUP BY d.id, d.host HAVING count(*)>=?
+        ORDER BY words DESC, d.host LIMIT ?
+        """,
+        [config.content.domain_min_documents, config.content.domain_limit],
+    ).fetchall()
+    domain_columns = [
+        "host",
+        "documentos",
+        "palavras",
+        "mediana_palavras_documento",
+        "mediana_palavras_frase",
+        "mediana_paragrafos",
+        "mediana_MATTR",
+        "mediana_densidade_lexical",
+        "media_repeticao_paragrafos",
+        "prevalencia_sinais",
+        "escopo",
+    ]
+    domain_rows = [
+        (*row, "prévia amostral não representativa" if sampled else "snapshot integral")
+        for row in domains
+    ]
+    write_table(tables, "20_perfil_textual_dominios", domain_columns, domain_rows)
+    write_table(
+        aggregates,
+        "perfil_textual_dominios",
+        domain_columns[:-1],
+        (row[:-1] for row in domain_rows[:20]),
+    )
+
+    vocabulary_curve = _vocabulary_curves(connection, config, root)
+    write_table(
+        tables,
+        "21_cobertura_vocabulario",
+        ["analise", "tipo", "ponto", "observado", "total", "fracao"],
+        vocabulary_curve,
+    )
+    write_table(
+        aggregates,
+        "cobertura_vocabulario",
+        ["analise", "tipo", "ponto", "observado", "total", "fracao"],
+        vocabulary_curve,
+    )
 
 
 def _domain_and_level_tables(connection, tables: Path, aggregates: Path, *, sampled: bool) -> None:

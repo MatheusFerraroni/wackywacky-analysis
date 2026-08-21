@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .clean import clean_representatives
 from .config import Config
+from .content import content_pass
 from .domains import inventory_domains
 from .errors import SourceChangedError, WackyWackyError
 from .io import atomic_json, read_json
@@ -27,7 +28,7 @@ def _stage(state_path: Path, state: dict, name: str) -> None:
 
 
 def run_pipeline(config: Config, *, resume: bool) -> dict:
-    with logged_stage("[1/11] Identidade do snapshot"):
+    with logged_stage("[1/12] Identidade do snapshot"):
         manifest = verify_snapshot(config)
     if resume:
         for previous_path in config.paths.work.glob("*/manifest.json"):
@@ -57,45 +58,53 @@ def run_pipeline(config: Config, *, resume: bool) -> dict:
         "stage": "verified",
     }
     atomic_json(state_path, state)
-    with logged_stage("[2/11] Inventário de domínios"):
+    with logged_stage("[2/12] Inventário de domínios"):
         domain_summary = inventory_domains(config, manifest, root)
         assert_snapshot(config, manifest)
     _stage(state_path, state, "domains")
-    with logged_stage("[3/11] Leitura e validação de páginas"):
+    with logged_stage("[3/12] Leitura e validação de páginas"):
         scan = scan_pages(config, manifest, root, resume=resume)
     if not scan.get("complete"):
         _stage(state_path, state, "interrupted")
         return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
     _stage(state_path, state, "pages")
-    with logged_stage("[4/11] Deduplicação exata D1/D2"):
+    with logged_stage("[4/12] Deduplicação exata D1/D2"):
         exact = reduce_exact(config, root)
         assert_snapshot(config, manifest)
     _stage(state_path, state, "exact")
-    with logged_stage("[5/11] Gate da revisão privada"):
+    with logged_stage("[5/12] Gate da revisão privada"):
         gate = require_approved_review(config, root)
     state["review_gate"] = gate
     _stage(state_path, state, "review_approved")
-    with logged_stage("[6/11] Limpeza e deduplicação D3"):
+    with logged_stage("[6/12] Limpeza e deduplicação D3"):
         clean = clean_representatives(config, manifest, root)
     if clean.get("complete") is False:
         _stage(state_path, state, "interrupted")
         return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
     assert_snapshot(config, manifest)
     _stage(state_path, state, "clean")
-    with logged_stage("[7/11] Estatísticas lexicais"):
+    with logged_stage("[7/12] Estatísticas lexicais"):
         lexical = lexical_pass(config, manifest, root)
         assert_snapshot(config, manifest)
     _stage(state_path, state, "lexical")
-    with logged_stage("[8/11] Validação de invariantes"):
-        validate_invariants(exact, clean, lexical, root)
+    with logged_stage("[8/12] Estrutura e conteúdo textual"):
+        content = content_pass(config, manifest, root)
+    if content.get("complete") is False:
+        _stage(state_path, state, "interrupted")
+        return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
+    _stage(state_path, state, "content")
+    with logged_stage("[9/12] Validação de invariantes"):
+        validate_invariants(exact, clean, lexical, root, content=content)
     _stage(state_path, state, "validated")
-    with logged_stage("[9/11] Tabelas e agregados"):
-        result = build_reports(config, manifest, domain_summary, exact, clean, lexical, root)
+    with logged_stage("[10/12] Tabelas e agregados"):
+        result = build_reports(
+            config, manifest, domain_summary, exact, clean, lexical, content, root
+        )
     from .render import render_all
 
-    with logged_stage("[10/11] Figuras"):
+    with logged_stage("[11/12] Figuras"):
         render_all(result)
-    with logged_stage("[11/11] Checksums finais"):
+    with logged_stage("[12/12] Checksums finais"):
         write_checksums(result)
     state["result"] = str(result)
     _stage(state_path, state, "complete")

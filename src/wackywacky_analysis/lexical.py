@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import unicodedata
 from collections import Counter
+from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -14,13 +15,23 @@ from typing import Any
 import pyarrow as pa
 import spacy
 
+from .bclean import clean_again, iter_bclean
 from .config import Config
 from .errors import WackyWackyError
 from .io import atomic_json, decode_field, iter_bounded_tsv, parse_int
 from .progress import LOGGER, ByteProgress
 from .schema import PAGES_COLUMNS
 from .storage import SortedMembership, duckdb_connection, duckdb_copy_atomic, write_parquet_atomic
-from .text import TextDecodeFailure, block_units, decode_text, paragraph_units, remove_intervals
+from .text import TextDecodeFailure, decode_text
+
+_clean_again = clean_again
+SPACY_MAX_TOKENS_PER_CHUNK = 1024
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    raw: Any
+    annotated: tuple[Any, ...]
 
 DOCUMENT_SCHEMA = pa.schema(
     [
@@ -97,6 +108,18 @@ class SpaceSaving:
                 self._compact_if_needed()
                 return
 
+    @classmethod
+    def restore(
+        cls, capacity: int, rows: list[tuple[str, int, int, int]]
+    ) -> SpaceSaving:
+        instance = cls(capacity)
+        for key, count, error, version in rows:
+            instance.values[key] = (count, error, version)
+            instance.heap.append((count, version, key))
+            instance.version = max(instance.version, version)
+        heapq.heapify(instance.heap)
+        return instance
+
     def _compact_if_needed(self) -> None:
         maximum = max(4096, 4 * self.capacity)
         if len(self.heap) <= maximum:
@@ -170,7 +193,60 @@ def _load_nlp(config: Config):
             f"modelo spaCy ausente: {model}; instale a versão registrada antes do run"
         ) from exc
     nlp.max_length = max(nlp.max_length, config.runtime.max_text_bytes + 1)
+    if not any(name in nlp.pipe_names for name in ("parser", "senter", "sentencizer")):
+        nlp.add_pipe("sentencizer")
     return nlp
+
+
+def _nlp_queue_bytes(config: Config) -> int:
+    """Bound materialized spaCy Docs independently of the general I/O queue."""
+    return min(config.runtime.queue_bytes, max(1, config.runtime.workers) * 1024 * 1024)
+
+
+def _parse_document(nlp, text: str) -> ParsedDocument:
+    """Tokenize globally, but run statistical components in bounded token chunks."""
+    raw = nlp.make_doc(text)
+    if "sentencizer" in nlp.pipe_names:
+        nlp.get_pipe("sentencizer")(raw)
+    elif "senter" in nlp.pipe_names:
+        nlp.get_pipe("senter")(raw)
+    elif "parser" in nlp.pipe_names:
+        nlp.get_pipe("parser")(raw)
+    spans = []
+    start = 0
+    for sentence in raw.sents:
+        if sentence.end - start > SPACY_MAX_TOKENS_PER_CHUNK and sentence.start > start:
+            spans.append(raw[start : sentence.start])
+            start = sentence.start
+        while sentence.end - start > SPACY_MAX_TOKENS_PER_CHUNK:
+            spans.append(raw[start : start + SPACY_MAX_TOKENS_PER_CHUNK])
+            start += SPACY_MAX_TOKENS_PER_CHUNK
+    if start < len(raw):
+        spans.append(raw[start:])
+    disabled = [
+        name for name in ("sentencizer", "senter", "parser") if name in nlp.pipe_names
+    ]
+    annotated = tuple(
+        nlp.pipe(
+            (span.as_doc(copy_user_data=False) for span in spans),
+            disable=disabled,
+            n_process=1,
+            batch_size=1,
+        )
+    )
+    return ParsedDocument(raw=raw, annotated=annotated)
+
+
+def _iter_tokens(document):
+    if isinstance(document, ParsedDocument):
+        for chunk in document.annotated:
+            yield from chunk
+    else:
+        yield from document
+
+
+def _raw_document(document):
+    return document.raw if isinstance(document, ParsedDocument) else document
 
 
 def spacy_identity(config: Config) -> dict:
@@ -180,38 +256,8 @@ def spacy_identity(config: Config) -> dict:
         "model": config.lexical.spacy_model,
         "model_version": nlp.meta.get("version", "blank"),
         "pipeline": list(nlp.pipe_names),
+        "max_tokens_per_chunk": SPACY_MAX_TOKENS_PER_CHUNK,
     }
-
-
-def _clean_again(
-    config: Config,
-    candidates: sqlite3.Connection,
-    domain_id: int | None,
-    normalized: str,
-) -> str:
-    if domain_id is None:
-        return normalized
-    paragraph_intervals: list[tuple[int, int]] = []
-    for start, end, unit, _text in paragraph_units(
-        normalized, config.boilerplate.paragraph_min_chars
-    ):
-        if candidates.execute(
-            "SELECT 1 FROM candidate WHERE domain_id=? AND kind='paragraph' AND digest=?",
-            (domain_id, unit),
-        ).fetchone():
-            paragraph_intervals.append((start, end))
-    intervals = list(paragraph_intervals)
-    for start, end, unit, _text in block_units(
-        normalized, config.boilerplate.block_lines, config.boilerplate.block_min_chars
-    ):
-        if any(start < p_end and end > p_start for p_start, p_end in paragraph_intervals):
-            continue
-        if candidates.execute(
-            "SELECT 1 FROM candidate WHERE domain_id=? AND kind='block' AND digest=?",
-            (domain_id, unit),
-        ).fetchone():
-            intervals.append((start, end))
-    return remove_intervals(normalized, intervals)[0]
 
 
 def _token_data(
@@ -221,7 +267,7 @@ def _token_data(
     lemmas: list[tuple[str, bool]] = []
     numbers = other = 0
     paragraph_words: list[str] = []
-    for token in document:
+    for token in _iter_tokens(document):
         if token.is_alpha:
             form = unicodedata.normalize("NFC", token.text).casefold()
             lemma = unicodedata.normalize("NFC", token.lemma_ or token.text).casefold()
@@ -236,6 +282,7 @@ def _token_data(
 
 
 def _paragraph_word_sequences(document, text: str) -> list[list[str]]:
+    document = _raw_document(document)
     sequences: list[list[str]] = [[]]
     previous_end = 0
     for token in document:
@@ -272,11 +319,15 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         "model": config.lexical.spacy_model,
         "model_version": nlp.meta.get("version", "blank"),
         "pipeline": list(nlp.pipe_names),
+        "max_tokens_per_chunk": SPACY_MAX_TOKENS_PER_CHUNK,
     }
     identity_path = root / "spacy.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise WackyWackyError("versão do spaCy/modelo difere da execução iniciada")
     atomic_json(identity_path, identity)
+    from .content import EmbeddedContentWriter
+
+    content_writer = EmbeddedContentWriter(config, root)
     d2 = SortedMembership(root / "d2_representatives.u64")
     d3 = SortedMembership(root / "d3_representatives.u64")
     candidate_path = root / "boilerplate.sqlite"
@@ -307,6 +358,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         nonlocal document_chunk, documents
         forms, lemmas, numbers, other, _words = _token_data(document)
         if view == "B_clean":
+            content_writer.add(row, domain, level, text, document)
             for words in _paragraph_word_sequences(document, text):
                 for left, right in pairwise(words):
                     bigrams.add(left + "\t" + right)
@@ -334,11 +386,9 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         nonlocal jobs, job_bytes
         if not jobs:
             return
-        texts = [job[3] for job in jobs]
-        process_count = min(config.runtime.workers, len(jobs))
-        parsed = nlp.pipe(texts, n_process=process_count, batch_size=16)
-        for job, document in zip(jobs, parsed, strict=True):
+        for job in jobs:
             row, domain, level, text, views = job
+            document = _parse_document(nlp, text)
             for view in views:
                 emit(view, row, domain, level, text, document)
         jobs = []
@@ -354,7 +404,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         nonlocal job_bytes
         jobs.append((row, domain, level, text, views))
         job_bytes += 4 * len(text)
-        if job_bytes >= config.runtime.queue_bytes or len(jobs) >= 1024:
+        if job_bytes >= _nlp_queue_bytes(config) or len(jobs) >= 1024:
             flush_jobs()
 
     with config.analysis_pages.open("rb") as handle:
@@ -384,7 +434,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
             if is_d2:
                 views.append("E_exact")
             if is_d3:
-                clean = _clean_again(config, candidates, domain, decoded.normalized)
+                clean = clean_again(config, candidates, domain, decoded.normalized)
                 if clean:
                     if clean == decoded.normalized:
                         views.append("B_clean")
@@ -399,6 +449,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
             document_dir / f"documents-{document_chunk:06d}.parquet", documents, DOCUMENT_SCHEMA
         )
     vocabulary.flush()
+    content_writer.finish(identity, manifest["sources"]["pages"]["size"])
     LOGGER.info("Léxico: reduzindo partições de vocabulário no DuckDB")
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
@@ -501,8 +552,6 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
 def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bound: int) -> dict:
     counts = Counter()
     documents = Counter()
-    membership = SortedMembership(root / "d3_representatives.u64")
-    candidates = sqlite3.connect(f"file:{root / 'boilerplate.sqlite'}?mode=ro", uri=True)
     jobs: list[str] = []
     job_bytes = 0
     progress = ByteProgress("Recontagem de bigramas", config.analysis_pages.stat().st_size)
@@ -511,12 +560,8 @@ def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bou
         nonlocal jobs, job_bytes
         if not jobs:
             return
-        parsed = nlp.pipe(
-            jobs,
-            n_process=min(config.runtime.workers, len(jobs)),
-            batch_size=16,
-        )
-        for clean, document in zip(jobs, parsed, strict=True):
+        for clean in jobs:
+            document = nlp.make_doc(clean)
             seen: set[str] = set()
             for words in _paragraph_word_sequences(document, clean):
                 for left, right in pairwise(words):
@@ -528,30 +573,17 @@ def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bou
         jobs = []
         job_bytes = 0
 
-    with config.analysis_pages.open("rb") as handle:
-        for record in iter_bounded_tsv(
-            handle,
-            columns=len(PAGES_COLUMNS),
-            max_line_bytes=config.runtime.max_line_bytes,
-            max_rows=config.runtime.max_rows,
-        ):
-            progress.update(record.end_offset, detail=f"linha {record.row_number:,}")
-            if not membership.contains(record.row_number) or record.fields is None:
-                continue
-            fields = record.fields
-            try:
-                decoded = decode_text(fields[13], fields[15], config.runtime.max_text_bytes)
-            except TextDecodeFailure:
-                continue
-            domain = parse_int(fields[1])
-            clean = _clean_again(config, candidates, domain, decoded.normalized)
-            jobs.append(clean)
-            job_bytes += 4 * len(clean)
-            if job_bytes >= config.runtime.queue_bytes or len(jobs) >= 1024:
-                flush()
+    for item in iter_bclean(config, root):
+        progress.update(
+            item.source.end_offset, detail=f"linha {item.source.row_number:,}"
+        )
+        jobs.append(item.text)
+        job_bytes += 4 * len(item.text)
+        if job_bytes >= _nlp_queue_bytes(config) or len(jobs) >= 1024:
+            flush()
     flush()
+    progress.update(config.analysis_pages.stat().st_size)
     progress.finish(detail="segunda passagem concluída")
-    candidates.close()
     rows = [
         {
             "bigram": term,

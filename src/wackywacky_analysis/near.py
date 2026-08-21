@@ -12,12 +12,11 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 
+from .bclean import iter_bclean
 from .config import Config
-from .io import atomic_json, iter_bounded_tsv, parse_int
-from .lexical import _clean_again, _load_nlp, _token_data
-from .schema import PAGES_COLUMNS
-from .storage import SortedMembership, write_parquet_atomic
-from .text import TextDecodeFailure, decode_text
+from .io import atomic_json
+from .lexical import _load_nlp, _token_data
+from .storage import write_parquet_atomic
 
 NEAR_SCHEMA = pa.schema(
     [
@@ -89,8 +88,6 @@ def run_near_duplicates(config: Config, root: Path) -> dict:
         return json.loads(output.read_text(encoding="utf-8"))
     near = config.near_duplicates
     nlp = _load_nlp(config)
-    membership = SortedMembership(root / "d3_representatives.u64")
-    boilerplate = sqlite3.connect(f"file:{root / 'boilerplate.sqlite'}?mode=ro", uri=True)
     database = root / "near.sqlite"
     partial_database = root / "near.sqlite.partial"
     for stale in (
@@ -118,64 +115,50 @@ def run_near_duplicates(config: Config, root: Path) -> dict:
     union = UnionFind()
     confirmed_pairs = candidate_pairs = 0
     metadata: dict[int, tuple[int, int | None, str]] = {}
-    with config.analysis_pages.open("rb") as handle:
-        for record in iter_bounded_tsv(
-            handle,
-            columns=len(PAGES_COLUMNS),
-            max_line_bytes=config.runtime.max_line_bytes,
-            max_rows=config.runtime.max_rows,
-        ):
-            if not membership.contains(record.row_number) or record.fields is None:
-                continue
-            fields = record.fields
-            try:
-                decoded = decode_text(fields[13], fields[15], config.runtime.max_text_bytes)
-            except TextDecodeFailure:
-                continue
-            domain_id = parse_int(fields[1])
-            clean = _clean_again(config, boilerplate, domain_id, decoded.normalized)
-            words = _token_data(nlp(clean))[4]
-            if len(words) < near.minimum_words:
-                continue
-            shingles = _shingles(words, near.shingle_words)
-            if not shingles:
-                continue
-            signature = _signature(shingles, parameters)
-            clean_sha = hashlib.sha256(clean.encode()).hexdigest()
-            metadata[record.row_number] = (len(words), domain_id, clean_sha)
-            sql.execute(
-                "INSERT OR REPLACE INTO document VALUES (?, ?, ?, ?, ?)",
-                (record.row_number, len(words), domain_id, clean_sha, _pack(shingles)),
+    for item in iter_bclean(config, root):
+        domain_id = item.domain_id
+        words = _token_data(nlp.make_doc(item.text))[4]
+        if len(words) < near.minimum_words:
+            continue
+        shingles = _shingles(words, near.shingle_words)
+        if not shingles:
+            continue
+        signature = _signature(shingles, parameters)
+        clean_sha = hashlib.sha256(item.text.encode()).hexdigest()
+        metadata[item.source.row_number] = (len(words), domain_id, clean_sha)
+        sql.execute(
+            "INSERT OR REPLACE INTO document VALUES (?, ?, ?, ?, ?)",
+            (item.source.row_number, len(words), domain_id, clean_sha, _pack(shingles)),
+        )
+        possible: set[int] = set()
+        for band in range(near.bands):
+            values = signature[band * near.rows_per_band : (band + 1) * near.rows_per_band]
+            digest = hashlib.blake2b(
+                struct.pack(f"<{near.rows_per_band}Q", *values), digest_size=16
+            ).digest()
+            possible.update(
+                row[0]
+                for row in sql.execute(
+                    "SELECT row_number FROM bucket WHERE band=? AND digest=?",
+                    (band, digest),
+                )
             )
-            possible: set[int] = set()
-            for band in range(near.bands):
-                values = signature[band * near.rows_per_band : (band + 1) * near.rows_per_band]
-                digest = hashlib.blake2b(
-                    struct.pack(f"<{near.rows_per_band}Q", *values), digest_size=16
-                ).digest()
-                possible.update(
-                    row[0]
-                    for row in sql.execute(
-                        "SELECT row_number FROM bucket WHERE band=? AND digest=?",
-                        (band, digest),
-                    )
-                )
+            sql.execute(
+                "INSERT INTO bucket VALUES (?, ?, ?)",
+                (band, digest, item.source.row_number),
+            )
+        for other in possible:
+            candidate_pairs += 1
+            other_shingles = _unpack(
                 sql.execute(
-                    "INSERT INTO bucket VALUES (?, ?, ?)", (band, digest, record.row_number)
-                )
-            for other in possible:
-                candidate_pairs += 1
-                other_shingles = _unpack(
-                    sql.execute(
-                        "SELECT shingles FROM document WHERE row_number=?", (other,)
-                    ).fetchone()[0]
-                )
-                similarity = len(shingles & other_shingles) / len(shingles | other_shingles)
-                if similarity >= near.jaccard:
-                    confirmed_pairs += 1
-                    union.union(record.row_number, other)
-            sql.commit()
-    boilerplate.close()
+                    "SELECT shingles FROM document WHERE row_number=?", (other,)
+                ).fetchone()[0]
+            )
+            similarity = len(shingles & other_shingles) / len(shingles | other_shingles)
+            if similarity >= near.jaccard:
+                confirmed_pairs += 1
+                union.union(item.source.row_number, other)
+        sql.commit()
     components: dict[int, list[int]] = defaultdict(list)
     for row in union.parent:
         components[union.find(row)].append(row)

@@ -13,7 +13,9 @@ No perfil `tiny`, `sample` lê janelas determinísticas distribuídas por `pages
 7. A segunda passagem remove a união das ocorrências aprovadas, sem regra global para linhas curtas. Só textos vazios saem de `B_clean`; D3 deduplica novamente.
 8. A passagem lexical calcula formas observadas e lemas com spaCy. Palavras são tokens alfabéticos; números e outros tokens ficam separados. Bigramas não atravessam parágrafos.
 9. Frequências de formas/lemas usam spills e 256 partições; bigramas usam Space-Saving e recontagem exata. O top-K só é publicado quando o limite do item omitido fica abaixo do último item publicado.
-10. `near-duplicates` é opcional: documentos com ≥50 palavras, shingles de cinco palavras, 112 MinHashes em 14×8 e confirmação por Jaccard ≥0,85.
+10. A etapa de conteúdo caracteriza apenas `B_clean`, com checkpoint e fingerprint próprios. Ela mede frases, parágrafos, MATTR-100, classes gramaticais, repetição interna e sinais heurísticos sem excluir documentos.
+11. Trigramas não atravessam parágrafos e são recontados exatamente. PMI/NPMI usa marginais posicionais exatas dos bigramas e somente o universo certificado acima do limite do Space-Saving.
+12. `near-duplicates` é opcional: documentos com ≥50 palavras, shingles de cinco palavras, 112 MinHashes em 14×8 e confirmação por Jaccard ≥0,85.
 
 ## Atribuição a domínios
 
@@ -32,9 +34,13 @@ Hosts reais podem aparecer apenas nessas tabelas agregadas. Textos e URLs não e
 
 As saídas incluem status, funil, quantis de tamanho, duplicação, remoção, rendimento por recursão, concentração por domínio, vocabulário, hapax, Zipf e rankings. Todas as figuras são geradas de CSVs agregados em `results/`, sem reler os TSVs.
 
+Frases são delimitadas pelo `sentencizer` do spaCy e por limites de parágrafo. A tokenização cobre o documento inteiro; POS, morfologia e lematização são inferidos em blocos determinísticos de até 1.024 tokens para limitar a memória, portanto as bordas dos blocos não compartilham contexto do modelo. MATTR é calculado apenas em documentos com pelo menos 100 palavras. POS e morfologia são estimativas do modelo, não anotações humanas. Repetição e sinais de fragmentação, extensão, pontuação, conteúdo não lexical e mojibake são indicadores descritivos e não filtros.
+
+A acumulação do vocabulário usa uma ordem aleatória determinística baseada em SHA-256; não representa tempo nem a ordem física do TSV. Perfis textuais de domínio exigem ao menos 20 documentos e são limitados aos 100 maiores por palavras.
+
 Na prévia `tiny`, distribuições descrevem apenas a composição estratificada selecionada. Indicadores por `request_count` ficam como não aplicáveis porque não é válido combinar palavras amostradas com requisições integrais dos domínios.
 
-A primeira versão não analisa tempo, segurança/ética, Heaps ou classificação completa de idioma. `blocked_language` permanece na distribuição de estados.
+A primeira versão não analisa tempo, segurança/ética, agrupamento temático TF-IDF ou classificação completa de idioma. `blocked_language` permanece na distribuição de estados.
 
 ## Reprodutibilidade e falhas
 

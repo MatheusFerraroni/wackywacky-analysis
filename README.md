@@ -41,6 +41,8 @@ uv run wackywacky run --config configs/full.toml
 
 Em terminal interativo, o comando usa barras `tqdm` com velocidade e ETA; quando redirecionado, grava o mesmo progresso periodicamente no `stderr`. O JSON final permanece isolado no `stdout`.
 
+Após o léxico, `run` caracteriza somente `B_clean`: estrutura de frases e parágrafos, diversidade lexical, classes gramaticais, repetição interna, sinais textuais, colocações e variação entre domínios. A etapa possui checkpoint próprio; `--resume` complementa snapshots antigos sem refazer inventário, deduplicação ou revisão.
+
 Quando houver candidatos intradomínio, `run` termina com código 2 e grava a amostra privada em `work/`. Rotule cada item como `boilerplate`, `conteúdo` ou `incerto`:
 
 O CSV mantém um item por linha física, mostra quebras internas como `[QUEBRA]` e começa por `sample_id` e `frequencia`. Todo `label` começa como `boilerplate`; altere somente as exceções para `conteúdo` ou `incerto`. Prévias longas são reduzidas de forma explícita.
@@ -59,6 +61,8 @@ uv run wackywacky render --config configs/full.toml --snapshot-id SNAPSHOT_ID
 ```
 
 `render` lê somente agregados. Scratch, Parquet, bancos e revisão privada ficam ignorados; `results/<snapshot-id>/` contém apenas manifests, tabelas e figuras publicáveis.
+
+Alterações apenas no estilo das figuras continuam exigindo somente `render`. Alterações nas métricas de `[content]` retomam apenas a análise de conteúdo.
 
 ## Validação local
 

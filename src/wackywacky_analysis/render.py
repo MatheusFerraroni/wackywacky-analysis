@@ -72,6 +72,15 @@ def render_all(result: Path) -> None:
     _levels(data, figures)
     _zipf(data, figures)
     _top(data, figures)
+    if (data / "estrutura_textual.csv").exists():
+        _content_structure(data, figures)
+        _content_diversity(data, figures)
+        _content_grammar(data, figures)
+        _content_repetition(data, figures)
+        _content_signals(data, figures)
+        _content_collocations(data, figures)
+        _content_domains(data, figures)
+        _content_vocabulary(data, figures)
 
 
 def _status(data: Path, output: Path) -> None:
@@ -242,3 +251,182 @@ def _top(data: Path, output: Path) -> None:
     for ax in axes:
         ax.set_xlabel("Frequência")
     _save(fig, output, "09_principais_palavras_bigramas")
+
+
+def _weighted_ecdf(ax, rows: list[dict[str, str]], label: str, color: str) -> None:
+    values = [float(row["valor"]) for row in rows]
+    counts = [int(row.get("unidades", row.get("documentos", "0"))) for row in rows]
+    total = sum(counts)
+    ax.step(values, np.cumsum(counts) / total if total else [], where="post", label=label, color=color)
+
+
+def _content_structure(data: Path, output: Path) -> None:
+    rows = _read(data / "estrutura_textual.csv")
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    selections = (
+        ("palavras_por_frase", "Palavras por frase", BLUE),
+        ("palavras_por_paragrafo", "Palavras por parágrafo", GREEN),
+        ("frases_por_documento", "Frases por documento", ORANGE),
+    )
+    for ax, (metric, label, color) in zip(axes, selections, strict=True):
+        selected = [row for row in rows if row["metrica"] == metric]
+        _weighted_ecdf(ax, selected, label, color)
+        ax.set_xscale("symlog", linthresh=1)
+        ax.set_xlabel(label)
+        ax.set_ylabel("Fração acumulada")
+    fig.suptitle("Estrutura dos textos em B_clean")
+    _save(fig, output, "10_estrutura_textual")
+
+
+def _content_diversity(data: Path, output: Path) -> None:
+    rows = _read(data / "diversidade_lexical.csv")
+    fig, ax = plt.subplots()
+    for metric, color in (("TTR", BLUE), ("MATTR", ORANGE)):
+        selected = [row for row in rows if row["metrica"] == metric]
+        _weighted_ecdf(ax, selected, metric, color)
+    ax.set_xlabel("Diversidade lexical")
+    ax.set_ylabel("Fração acumulada de documentos")
+    ax.set_xlim(0, 1)
+    ax.legend()
+    ax.set_title("TTR e MATTR por documento")
+    _save(fig, output, "11_diversidade_lexical")
+
+
+def _content_grammar(data: Path, output: Path) -> None:
+    rows = sorted(
+        _read(data / "classes_gramaticais.csv"),
+        key=lambda row: float(row["participacao"]),
+    )
+    fig, ax = plt.subplots()
+    ax.barh(
+        [row["classe"] for row in rows],
+        [float(row["participacao"]) for row in rows],
+        color=BLUE,
+    )
+    ax.set_xlabel("Participação nas palavras")
+    ax.set_title("Classes gramaticais estimadas pelo spaCy")
+    _save(fig, output, "12_composicao_gramatical")
+
+
+def _content_repetition(data: Path, output: Path) -> None:
+    rows = _read(data / "repeticao_interna.csv")
+    fig, ax = plt.subplots()
+    for unit, label, color in (
+        ("frases", "Frases", BLUE),
+        ("paragrafos", "Parágrafos", ORANGE),
+    ):
+        selected = [row for row in rows if row["unidade"] == unit]
+        normalized = [
+            {"valor": row["fracao"], "documentos": row["documentos"]} for row in selected
+        ]
+        _weighted_ecdf(ax, normalized, label, color)
+    ax.set_xlabel("Fração de palavras em unidades repetidas")
+    ax.set_ylabel("Fração acumulada de documentos")
+    ax.legend()
+    ax.set_title("Repetição interna residual em B_clean")
+    _save(fig, output, "13_repeticao_interna")
+
+
+def _content_signals(data: Path, output: Path) -> None:
+    rows = sorted(
+        _read(data / "sinais_textuais.csv"), key=lambda row: float(row["participacao"])
+    )
+    labels = {
+        "frases_fragmentadas": "frases fragmentadas",
+        "frases_longas": "frases longas",
+        "tokens_longos": "tokens longos",
+        "URLs_no_texto": "URLs no texto",
+        "emails_no_texto": "e-mails no texto",
+        "sequencias_pontuacao": "sequências de pontuação",
+        "marcadores_mojibake": "marcadores de mojibake",
+        "alta_fracao_numerica": "alta fração numérica",
+        "alta_fracao_nao_lexical": "alta fração não lexical",
+        "alta_fracao_caixa_alta": "alta fração em caixa alta",
+    }
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(
+        [labels.get(row["indicador"], row["indicador"].replace("_", " ")) for row in rows],
+        [float(row["participacao"]) for row in rows],
+        color=ORANGE,
+    )
+    ax.set_xlabel("Participação dos documentos")
+    ax.set_title("Prevalência de sinais textuais heurísticos")
+    _save(fig, output, "14_sinais_textuais")
+
+
+def _content_collocations(data: Path, output: Path) -> None:
+    rows = _read(data / "colocacoes.csv")
+    bigrams = [row for row in rows if row["ranking"] == "bigrama_NPMI"][:20]
+    trigrams = [row for row in rows if row["ranking"] == "trigrama_frequente"][:20]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 7))
+    axes[0].barh(
+        [row["item"] for row in reversed(bigrams)],
+        [float(row["NPMI"]) for row in reversed(bigrams)],
+        color=BLUE,
+    )
+    axes[0].set_xlabel("NPMI")
+    axes[0].set_title("Bigramas associados")
+    axes[1].barh(
+        [row["item"] for row in reversed(trigrams)],
+        [int(row["frequencia"]) for row in reversed(trigrams)],
+        color=GREEN,
+    )
+    axes[1].set_xlabel("Frequência")
+    axes[1].set_title("Trigramas frequentes")
+    _save(fig, output, "15_colocacoes")
+
+
+def _content_domains(data: Path, output: Path) -> None:
+    rows = _read(data / "perfil_textual_dominios.csv")[:15]
+    rows.reverse()
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    metrics = (
+        ("mediana_palavras_frase", "Mediana de palavras por frase", BLUE),
+        ("mediana_MATTR", "Mediana de MATTR", GREEN),
+        ("mediana_densidade_lexical", "Mediana da densidade lexical", PURPLE),
+        ("media_repeticao_paragrafos", "Repetição média de parágrafos", ORANGE),
+    )
+    for ax, (field, title, color) in zip(axes.flat, metrics, strict=True):
+        ax.barh(
+            [row["host"] for row in rows],
+            [float(row[field] or 0) for row in rows],
+            color=color,
+        )
+        ax.set_title(title)
+    fig.suptitle("Perfil textual dos principais domínios")
+    _save(fig, output, "16_perfil_textual_dominios")
+
+
+def _content_vocabulary(data: Path, output: Path) -> None:
+    rows = _read(data / "cobertura_vocabulario.csv")
+    accumulation = [row for row in rows if row["analise"] == "documentos_aleatorios"]
+    coverage = [row for row in rows if row["analise"] == "top_termos"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for kind, label, color in (("form", "Formas", BLUE), ("lemma", "Lemas", ORANGE)):
+        selected = [row for row in accumulation if row["tipo"] == kind]
+        axes[0].plot(
+            [int(row["ponto"]) for row in selected],
+            [int(row["observado"]) for row in selected],
+            label=label,
+            color=color,
+        )
+        selected = [row for row in coverage if row["tipo"] == kind]
+        axes[1].plot(
+            [int(row["ponto"]) for row in selected],
+            [float(row["fracao"]) for row in selected],
+            marker="o",
+            label=label,
+            color=color,
+        )
+    axes[0].set_xscale("log")
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("Documentos em ordem aleatória determinística")
+    axes[0].set_ylabel("Tipos observados")
+    axes[0].set_title("Acumulação do vocabulário")
+    axes[1].set_xscale("log")
+    axes[1].set_xlabel("Top-K termos")
+    axes[1].set_ylabel("Fração das ocorrências")
+    axes[1].set_title("Cobertura pelas formas mais frequentes")
+    for ax in axes:
+        ax.legend()
+    _save(fig, output, "17_cobertura_vocabulario")

@@ -81,6 +81,19 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
     for value in vocabulary.values():
         assert value["document_occurrences"] <= value["occurrences"]
     assert (result / "figures" / "09_principais_palavras_bigramas.svg").is_file()
+    assert summary["content"]["status"] == "complete"
+    assert summary["content"]["metrics"]["documents"] == summary["clean"]["d3_unique"]
+    assert (result / "tables" / "14_estrutura_sentencas_paragrafos.csv").is_file()
+    assert (result / "tables" / "21_cobertura_vocabulario.csv").is_file()
+    assert (result / "figures" / "10_estrutura_textual.svg").is_file()
+    assert (result / "figures" / "17_cobertura_vocabulario.svg").is_file()
+    with (result / "tables" / "19_colocacoes.csv").open(encoding="utf-8", newline="") as handle:
+        collocations = list(csv.DictReader(handle))
+    assert all(
+        -1 <= float(row["NPMI"]) <= 1
+        for row in collocations
+        if row["ranking"] == "bigrama_NPMI"
+    )
     public = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
         for path in result.rglob("*")
@@ -122,7 +135,12 @@ def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) ->
         import_review(config, root, sample)
         result = Path(run_pipeline(config, resume=True)["result"])
         summary = json.loads((result / "summary.json").read_text())
-        summaries.append({key: summary[key] for key in ("domains", "exact", "clean", "lexical")})
+        summaries.append(
+            {
+                key: summary[key]
+                for key in ("domains", "exact", "clean", "lexical", "content")
+            }
+        )
     assert summaries[0] == summaries[1]
 
 

@@ -62,6 +62,28 @@ class Lexical:
 
 
 @dataclass(frozen=True)
+class Content:
+    enabled: bool = True
+    mattr_window: int = 100
+    fragment_max_words: int = 2
+    long_sentence_words: int = 100
+    long_token_chars: int = 30
+    punctuation_run: int = 4
+    repetition_sentence_min_words: int = 3
+    repetition_paragraph_min_chars: int = 20
+    high_numeric_fraction: float = 0.30
+    high_nonlexical_fraction: float = 0.30
+    high_uppercase_fraction: float = 0.50
+    fraction_min_tokens: int = 20
+    domain_min_documents: int = 20
+    domain_limit: int = 100
+    collocation_min_frequency: int = 20
+    collocation_min_documents: int = 5
+    trigram_candidates: int = 10_000
+    vocabulary_seed: int = 73_129
+
+
+@dataclass(frozen=True)
 class NearDuplicates:
     enabled: bool
     minimum_words: int
@@ -96,6 +118,7 @@ class Config:
     source: Source
     boilerplate: Boilerplate
     lexical: Lexical
+    content: Content
     near_duplicates: NearDuplicates
     sampling: Sampling
 
@@ -108,7 +131,21 @@ class Config:
 
     @property
     def fingerprint(self) -> str:
-        payload = json.dumps(self.public_dict(), sort_keys=True, separators=(",", ":"))
+        # A análise de conteúdo é um produto derivado. Mantê-la fora da identidade
+        # do pipeline-base permite complementar snapshots já validados sem refazer
+        # inventário, deduplicação ou revisão humana.
+        value = self.public_dict()
+        value.pop("content", None)
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @property
+    def content_fingerprint(self) -> str:
+        payload = json.dumps(
+            {"schema_version": 2, "content": asdict(self.content)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
     @property
@@ -165,6 +202,7 @@ def load_config(path: str | Path) -> Config:
             source=Source(**raw["source"]),
             boilerplate=Boilerplate(**raw["boilerplate"]),
             lexical=Lexical(**raw["lexical"]),
+            content=Content(**raw.get("content", {})),
             near_duplicates=NearDuplicates(**raw["near_duplicates"]),
             sampling=Sampling(**raw.get("sampling", {})),
         )
@@ -219,6 +257,35 @@ def _validate(config: Config) -> None:
         <= 0
     ):
         raise ConfigurationError("limites lexicais devem ser positivos")
+    content = config.content
+    if (
+        min(
+            content.mattr_window,
+            content.long_sentence_words,
+            content.long_token_chars,
+            content.punctuation_run,
+            content.repetition_sentence_min_words,
+            content.repetition_paragraph_min_chars,
+            content.fraction_min_tokens,
+            content.domain_min_documents,
+            content.domain_limit,
+            content.collocation_min_frequency,
+            content.collocation_min_documents,
+            content.trigram_candidates,
+        )
+        <= 0
+        or content.fragment_max_words < 0
+    ):
+        raise ConfigurationError("limites de conteúdo devem ser positivos")
+    if not all(
+        0 <= value <= 1
+        for value in (
+            content.high_numeric_fraction,
+            content.high_nonlexical_fraction,
+            content.high_uppercase_fraction,
+        )
+    ):
+        raise ConfigurationError("frações de conteúdo devem estar em [0, 1]")
     boilerplate = config.boilerplate
     if (
         min(
