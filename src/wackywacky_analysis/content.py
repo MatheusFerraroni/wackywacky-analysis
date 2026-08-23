@@ -517,9 +517,39 @@ def _remove_content_products(root: Path) -> None:
 class EmbeddedContentWriter:
     """Collect content features from the lexical pass without another tokenization."""
 
-    def __init__(self, config: Config, root: Path) -> None:
+    def __init__(
+        self,
+        config: Config,
+        root: Path,
+        *,
+        checkpoint_state: dict[str, Any] | None = None,
+    ) -> None:
         self.config = config
         self.root = root
+        if checkpoint_state is not None:
+            self.active = config.content.enabled
+            if not self.active:
+                return
+            if (
+                checkpoint_state.get("content_fingerprint") != config.content_fingerprint
+                or checkpoint_state.get("schema_version") != CONTENT_SCHEMA_VERSION
+            ):
+                raise RuntimeError("estado de conteúdo incompatível com o checkpoint lexical")
+            self.documents = []
+            self.histograms = Counter()
+            self.grammar = Counter()
+            self.vocabulary = {}
+            self.trigrams = _load_trigram_state(config, root, checkpoint_state)
+            self.chunk = int(checkpoint_state.get("next_chunk", 0))
+            self.checkpoint_number = int(checkpoint_state.get("checkpoint", 0))
+            self.documents_total = int(checkpoint_state.get("documents", 0))
+            self.bigram_positions = int(checkpoint_state.get("bigram_positions", 0))
+            self.trigram_positions = int(checkpoint_state.get("trigram_positions", 0))
+            self.last_row = int(checkpoint_state.get("next_row", 0))
+            self.artifacts = dict(checkpoint_state.get("artifacts", {}))
+            self._discard_uncommitted_chunks()
+            atomic_json(root / "content" / "state.json", checkpoint_state)
+            return
         state = read_json(root / "content" / "state.json", {})
         self.active = bool(
             config.content.enabled
@@ -538,10 +568,28 @@ class EmbeddedContentWriter:
         self.vocabulary: dict[tuple[str, str], str] = {}
         self.trigrams = SpaceSaving(config.content.trigram_candidates)
         self.chunk = 0
+        self.checkpoint_number = 0
         self.documents_total = 0
         self.bigram_positions = 0
         self.trigram_positions = 0
         self.last_row = 0
+        self.artifacts: dict[str, str] = {}
+
+    def _discard_uncommitted_chunks(self) -> None:
+        for directory in ("documents", "histograms", "grammar", "vocabulary-first"):
+            path = self.root / "content" / directory
+            if not path.exists():
+                continue
+            for parquet in path.glob("chunk-*.parquet"):
+                try:
+                    index = int(parquet.stem.rsplit("-", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                if index >= self.chunk:
+                    parquet.unlink(missing_ok=True)
+                    parquet.with_suffix(parquet.suffix + ".sha256").unlink(missing_ok=True)
+        for partial in (self.root / "content").rglob("*.partial"):
+            partial.unlink(missing_ok=True)
 
     def add(
         self,
@@ -560,6 +608,12 @@ class EmbeddedContentWriter:
             text=text,
         )
         result = analyze_document(self.config, record, document)
+        self.add_result(result, row_number=row_number)
+
+    def add_result(self, result: dict[str, Any], *, row_number: int) -> None:
+        """Merge a worker result without retaining its source text or spaCy Doc."""
+        if not self.active:
+            return
         self.documents.append(result["document"])
         self.histograms.update(result["histograms"])
         for value, count in result["pos"].items():
@@ -592,36 +646,78 @@ class EmbeddedContentWriter:
             self.grammar,
             self.vocabulary,
         )
+        for directory in ("documents", "histograms", "grammar", "vocabulary-first"):
+            path = self.root / "content" / directory / f"chunk-{self.chunk:06d}.parquet"
+            relative = str(path.relative_to(self.root))
+            self.artifacts[relative] = path.with_suffix(path.suffix + ".sha256").read_text(
+                encoding="ascii"
+            ).strip()
         self.chunk += 1
         self.documents = []
         self.histograms = Counter()
         self.grammar = Counter()
         self.vocabulary = {}
 
-    def finish(self, identity: dict, source_size: int) -> None:
+    def checkpoint(
+        self,
+        identity: dict,
+        *,
+        next_offset: int,
+        next_row: int,
+        complete: bool,
+    ) -> dict[str, Any]:
         if not self.active:
-            return
-        self._flush()
-        if self.chunk == 0:
-            _write_content_chunk(self.root, 0, [], Counter(), Counter(), {})
-            self.chunk = 1
-        trigram_state = _write_trigram_state(self.root, self.chunk, self.trigrams)
-        atomic_json(
-            self.root / "content" / "state.json",
-            {
+            return {
                 "schema_version": CONTENT_SCHEMA_VERSION,
                 "content_fingerprint": self.config.content_fingerprint,
-                "next_offset": source_size,
-                "next_row": self.last_row,
-                "next_chunk": self.chunk,
-                "documents": self.documents_total,
-                "bigram_positions": self.bigram_positions,
-                "trigram_positions": self.trigram_positions,
-                "trigram_state": trigram_state,
-                "spacy": identity,
                 "complete": True,
-                "collection": "embedded_in_lexical_pass",
-            },
+                "collection": "disabled",
+            }
+        self._flush()
+        if complete and self.chunk == 0:
+            _write_content_chunk(self.root, 0, [], Counter(), Counter(), {})
+            for directory in ("documents", "histograms", "grammar", "vocabulary-first"):
+                path = self.root / "content" / directory / "chunk-000000.parquet"
+                self.artifacts[str(path.relative_to(self.root))] = path.with_suffix(
+                    path.suffix + ".sha256"
+                ).read_text(encoding="ascii").strip()
+            self.chunk = 1
+        self.checkpoint_number += 1
+        trigram_state = _write_trigram_state(
+            self.root, self.checkpoint_number % 2, self.trigrams
+        )
+        trigram_path = self.root / "content" / trigram_state
+        for relative in tuple(self.artifacts):
+            if relative.startswith("content/trigram-state-"):
+                self.artifacts.pop(relative)
+        self.artifacts[str(trigram_path.relative_to(self.root))] = trigram_path.with_suffix(
+            trigram_path.suffix + ".sha256"
+        ).read_text(encoding="ascii").strip()
+        state = {
+            "schema_version": CONTENT_SCHEMA_VERSION,
+            "content_fingerprint": self.config.content_fingerprint,
+            "next_offset": next_offset,
+            "next_row": next_row,
+            "next_chunk": self.chunk,
+            "checkpoint": self.checkpoint_number,
+            "documents": self.documents_total,
+            "bigram_positions": self.bigram_positions,
+            "trigram_positions": self.trigram_positions,
+            "trigram_state": trigram_state,
+            "spacy": identity,
+            "complete": complete,
+            "collection": "embedded_in_lexical_pass",
+            "artifacts": dict(sorted(self.artifacts.items())),
+        }
+        atomic_json(self.root / "content" / "state.json", state)
+        return state
+
+    def finish(self, identity: dict, source_size: int) -> None:
+        self.checkpoint(
+            identity,
+            next_offset=source_size,
+            next_row=self.last_row,
+            complete=True,
         )
 
 

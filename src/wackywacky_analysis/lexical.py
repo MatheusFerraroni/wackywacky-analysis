@@ -3,22 +3,26 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import multiprocessing
 import shutil
+import signal
 import sqlite3
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import spacy
 
 from .bclean import clean_again, iter_bclean
 from .config import Config
 from .errors import WackyWackyError
-from .io import atomic_json, decode_field, iter_bounded_tsv, parse_int
+from .io import atomic_json, decode_field, iter_bounded_tsv, parse_int, read_json
 from .progress import LOGGER, ByteProgress
 from .schema import PAGES_COLUMNS
 from .storage import SortedMembership, duckdb_connection, duckdb_copy_atomic, write_parquet_atomic
@@ -74,6 +78,31 @@ BIGRAM_CANDIDATE_SCHEMA = pa.schema(
         ("maximum_error", pa.uint64()),
     ]
 )
+
+BIGRAM_STATE_SCHEMA = pa.schema(
+    [
+        ("bigram", pa.string()),
+        ("estimated_frequency", pa.uint64()),
+        ("maximum_error", pa.uint64()),
+        ("version", pa.uint64()),
+    ]
+)
+
+BIGRAM_RECOUNT_SCHEMA = pa.schema(
+    [
+        ("bigram", pa.string()),
+        ("total_frequency", pa.uint64()),
+        ("document_frequency", pa.uint64()),
+    ]
+)
+
+LEXICAL_STATE_SCHEMA_VERSION = 1
+BIGRAM_RECOUNT_STATE_SCHEMA_VERSION = 1
+LEXICAL_BATCH_BYTES = 8 * 1024 * 1024
+
+_WORKER_CONFIG: Config | None = None
+_WORKER_NLP = None
+_RECOUNT_WANTED: set[str] | None = None
 
 
 class SpaceSaving:
@@ -135,12 +164,23 @@ class SpaceSaving:
 
 
 class SpillVocabulary:
-    def __init__(self, root: Path, limit: int, partitions: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        limit: int,
+        partitions: int,
+        *,
+        index: int = 0,
+        artifacts: dict[str, str] | None = None,
+        artifact_root: Path | None = None,
+    ) -> None:
         self.root = root
         self.limit = limit
         self.partitions = partitions
         self.counts: dict[tuple[str, str, str], list[Any]] = {}
-        self.index = 0
+        self.index = index
+        self.artifacts = artifacts
+        self.artifact_root = artifact_root
 
     def document(
         self, view: str, forms: list[tuple[str, bool]], lemmas: list[tuple[str, bool]]
@@ -176,7 +216,10 @@ class SpillVocabulary:
                     "is_stop": stop,
                 }
             )
-        write_parquet_atomic(self.root / f"spill-{self.index:06d}.parquet", rows, SPILL_SCHEMA)
+        path = self.root / f"spill-{self.index:06d}.parquet"
+        checksum = write_parquet_atomic(path, rows, SPILL_SCHEMA)
+        if self.artifacts is not None and self.artifact_root is not None:
+            self.artifacts[str(path.relative_to(self.artifact_root))] = checksum
         self.index += 1
         self.counts.clear()
 
@@ -296,14 +339,186 @@ def _paragraph_word_sequences(document, text: str) -> list[list[str]]:
     return [sequence for sequence in sequences if sequence]
 
 
-def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
-    summary_path = root / "lexical_summary.json"
-    if summary_path.exists():
-        return json.loads(summary_path.read_text(encoding="utf-8"))
-    lexical_root = root / "lexical"
-    if lexical_root.exists():
-        shutil.rmtree(lexical_root)
-    for stale in (
+def _lexical_worker_init(config: Config) -> None:
+    global _WORKER_CONFIG, _WORKER_NLP
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _WORKER_CONFIG = config
+    _WORKER_NLP = _load_nlp(config)
+
+
+def _process_lexical_batch_with(
+    config: Config,
+    nlp,
+    batch: list[tuple[int, int | None, int | None, tuple[tuple[str, tuple[str, ...]], ...]]],
+) -> list[dict[str, Any]]:
+    from .content import analyze_document
+
+    results: list[dict[str, Any]] = []
+    for row, domain, level, variants in batch:
+        variant_results = []
+        for text, views in variants:
+            document = _parse_document(nlp, text)
+            forms, lemmas, numbers, other, _words = _token_data(document)
+            is_bclean = "B_clean" in views
+            content = None
+            bigrams: list[str] = []
+            if is_bclean:
+                from .bclean import BCleanRecord
+                from .io import BinaryRecord
+
+                if config.content.enabled:
+                    record = BCleanRecord(
+                        source=BinaryRecord(row, 0, 0, None),
+                        domain_id=domain,
+                        recursion_level=level,
+                        text=text,
+                    )
+                    content = analyze_document(config, record, document)
+                bigrams = [
+                    left + "\t" + right
+                    for words in _paragraph_word_sequences(document, text)
+                    for left, right in pairwise(words)
+                ]
+            variant_results.append(
+                {
+                    "views": views,
+                    "characters": len(text),
+                    "forms": forms,
+                    "lemmas": lemmas,
+                    "numbers": numbers,
+                    "other_tokens": other,
+                    "bigrams": bigrams,
+                    "content": content,
+                }
+            )
+        results.append(
+            {
+                "row_number": row,
+                "domain_id": domain,
+                "recursion_level": level,
+                "variants": variant_results,
+            }
+        )
+    return results
+
+
+def _lexical_worker_batch(batch: list[tuple]) -> list[dict[str, Any]]:
+    if _WORKER_CONFIG is None or _WORKER_NLP is None:
+        raise RuntimeError("worker lexical não inicializado")
+    return _process_lexical_batch_with(_WORKER_CONFIG, _WORKER_NLP, batch)
+
+
+def _recount_worker_init(config: Config, wanted: set[str]) -> None:
+    global _WORKER_CONFIG, _WORKER_NLP, _RECOUNT_WANTED
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _WORKER_CONFIG = config
+    _WORKER_NLP = _load_nlp(config)
+    _RECOUNT_WANTED = wanted
+
+
+def _process_recount_batch_with(nlp, wanted: set[str], batch: list[str]) -> dict[str, Counter]:
+    counts: Counter[str] = Counter()
+    documents: Counter[str] = Counter()
+    for clean in batch:
+        document = nlp.make_doc(clean)
+        seen: set[str] = set()
+        for words in _paragraph_word_sequences(document, clean):
+            for left, right in pairwise(words):
+                key = left + "\t" + right
+                if key in wanted:
+                    counts[key] += 1
+                    seen.add(key)
+        documents.update(seen)
+    return {"counts": counts, "documents": documents}
+
+
+def _recount_worker_batch(batch: list[str]) -> dict[str, Counter]:
+    if _WORKER_NLP is None or _RECOUNT_WANTED is None:
+        raise RuntimeError("worker de recontagem não inicializado")
+    return _process_recount_batch_with(_WORKER_NLP, _RECOUNT_WANTED, batch)
+
+
+class _OrderedBatchPool:
+    """Bound input bytes and merge completed worker batches in submission order."""
+
+    def __init__(self, config: Config, *, mode: str, wanted: set[str] | None = None) -> None:
+        self.config = config
+        self.mode = mode
+        self.wanted = wanted
+        self.workers = config.runtime.workers
+        self.maximum_pending = max(1, 2 * self.workers)
+        self.maximum_bytes = max(1, config.runtime.queue_bytes)
+        self.pending_bytes = 0
+        self.pending: deque[tuple[Future, int]] = deque()
+        self.executor: ProcessPoolExecutor | None = None
+        self.inline_nlp = None
+        if self.workers == 1:
+            self.inline_nlp = _load_nlp(config)
+        else:
+            context = multiprocessing.get_context("spawn")
+            if mode == "lexical":
+                initializer = _lexical_worker_init
+                initargs = (config,)
+            else:
+                initializer = _recount_worker_init
+                initargs = (config, wanted or set())
+            self.executor = ProcessPoolExecutor(
+                max_workers=self.workers,
+                mp_context=context,
+                initializer=initializer,
+                initargs=initargs,
+            )
+
+    def _run_inline(self, batch):
+        if self.mode == "lexical":
+            return _process_lexical_batch_with(self.config, self.inline_nlp, batch)
+        return _process_recount_batch_with(self.inline_nlp, self.wanted or set(), batch)
+
+    def _oldest(self):
+        future, size = self.pending.popleft()
+        self.pending_bytes -= size
+        try:
+            return future.result()
+        except BaseException as exc:
+            raise WackyWackyError(f"worker da etapa lexical falhou: {exc}") from exc
+
+    def submit(self, batch, size: int) -> list[Any]:
+        completed = []
+        while self.pending and (
+            len(self.pending) >= self.maximum_pending
+            or self.pending_bytes + size > self.maximum_bytes
+        ):
+            completed.append(self._oldest())
+        if self.executor is None:
+            completed.append(self._run_inline(batch))
+            return completed
+        target = _lexical_worker_batch if self.mode == "lexical" else _recount_worker_batch
+        future = self.executor.submit(target, batch)
+        self.pending.append((future, size))
+        self.pending_bytes += size
+        return completed
+
+    def drain(self) -> list[Any]:
+        completed = []
+        while self.pending:
+            completed.append(self._oldest())
+        return completed
+
+    def close(self) -> None:
+        if self.executor is not None:
+            self.executor.shutdown(wait=True, cancel_futures=False)
+            self.executor = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+def _derived_lexical_paths(root: Path) -> tuple[Path, ...]:
+    return (
+        root / "lexical_summary.json",
         root / "vocabulary.parquet",
         root / "vocabulary.parquet.sha256",
         root / "bigrams.parquet",
@@ -311,145 +526,400 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         root / "bigram_candidates.parquet",
         root / "bigram_candidates.parquet.sha256",
         root / "bigram_candidates.json",
-    ):
+    )
+
+
+def _reset_lexical_products(root: Path, reason: str) -> None:
+    from .content import _remove_content_products
+
+    LOGGER.info("Léxico: descartando somente artefatos da etapa 7 (%s)", reason)
+    shutil.rmtree(root / "lexical", ignore_errors=True)
+    for stale in _derived_lexical_paths(root):
         stale.unlink(missing_ok=True)
-    nlp = _load_nlp(config)
-    identity = {
-        "spacy": spacy.__version__,
-        "model": config.lexical.spacy_model,
-        "model_version": nlp.meta.get("version", "blank"),
-        "pipeline": list(nlp.pipe_names),
-        "max_tokens_per_chunk": SPACY_MAX_TOKENS_PER_CHUNK,
-    }
+    _remove_content_products(root)
+
+
+def _checkpoint_artifacts_valid(root: Path, artifacts: dict[str, str]) -> bool:
+    for relative, expected in artifacts.items():
+        path = root / relative
+        sidecar = path.with_suffix(path.suffix + ".sha256")
+        try:
+            if sidecar.read_text(encoding="ascii").strip() != expected:
+                return False
+            pq.read_metadata(path)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def _state_compatible(config: Config, manifest: dict, identity: dict, state: dict) -> bool:
+    return bool(
+        state.get("schema_version") == LEXICAL_STATE_SCHEMA_VERSION
+        and state.get("snapshot_id") == manifest["snapshot_id"]
+        and state.get("config_sha256") == config.fingerprint
+        and state.get("content_fingerprint") == config.content_fingerprint
+        and state.get("source_sha256") == manifest["sources"]["pages"]["sha256"]
+        and state.get("spacy") == identity
+    )
+
+
+def _discard_indexed_files(directory: Path, prefix: str, keep_before: int) -> None:
+    if not directory.exists():
+        return
+    for path in directory.glob(f"{prefix}-*.parquet"):
+        try:
+            index = int(path.stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if index >= keep_before:
+            path.unlink(missing_ok=True)
+            path.with_suffix(path.suffix + ".sha256").unlink(missing_ok=True)
+
+
+def _restore_bigram_state(config: Config, root: Path, state: dict) -> SpaceSaving:
+    name = state.get("bigram_state")
+    if not name:
+        return SpaceSaving(config.lexical.bigram_candidates)
+    rows = [
+        (
+            row["bigram"],
+            row["estimated_frequency"],
+            row["maximum_error"],
+            row["version"],
+        )
+        for row in pq.read_table(root / "lexical" / name).to_pylist()
+    ]
+    return SpaceSaving.restore(config.lexical.bigram_candidates, rows)
+
+
+def _write_bigram_state(root: Path, checkpoint: int, bigrams: SpaceSaving) -> tuple[str, str]:
+    name = f"bigram-state-{checkpoint % 2}.parquet"
+    path = root / "lexical" / name
+    checksum = write_parquet_atomic(
+        path,
+        [
+            {
+                "bigram": term,
+                "estimated_frequency": value[0],
+                "maximum_error": value[1],
+                "version": value[2],
+            }
+            for term, value in sorted(bigrams.values.items())
+        ],
+        BIGRAM_STATE_SCHEMA,
+    )
+    return name, checksum
+
+
+def _load_or_reset_lexical_state(
+    config: Config, manifest: dict, root: Path, identity: dict
+) -> dict:
+    lexical_root = root / "lexical"
+    state_path = lexical_root / "state.json"
+    state = read_json(state_path, {})
+    has_old_products = lexical_root.exists() and any(lexical_root.iterdir())
+    if state and not _state_compatible(config, manifest, identity, state):
+        _reset_lexical_products(root, "estado interno antigo ou incompatível")
+        return {}
+    if not state and has_old_products:
+        _reset_lexical_products(root, "estrutura lexical antiga sem checkpoint compatível")
+        return {}
+    if state and not _checkpoint_artifacts_valid(root, state.get("artifacts", {})):
+        _reset_lexical_products(root, "arquivo ou checksum do checkpoint inválido")
+        return {}
+    if state:
+        _discard_indexed_files(
+            lexical_root / "documents", "documents", int(state.get("document_index", 0))
+        )
+        _discard_indexed_files(
+            lexical_root / "spills", "spill", int(state.get("vocabulary_index", 0))
+        )
+        for partial in lexical_root.rglob("*.partial"):
+            partial.unlink(missing_ok=True)
+        LOGGER.info(
+            "Léxico: retomando offset %s, linha %s, checkpoint %s",
+            f"{int(state.get('next_offset', 0)):,}",
+            f"{int(state.get('next_row', 0)):,}",
+            f"{int(state.get('next_chunk', 0)):,}",
+        )
+    return state
+
+
+def _scan_lexical(
+    config: Config,
+    manifest: dict,
+    root: Path,
+    identity: dict,
+    state: dict,
+) -> tuple[dict, SpaceSaving]:
+    from .content import EmbeddedContentWriter
+
+    lexical_root = root / "lexical"
+    document_dir = lexical_root / "documents"
+    spill_dir = lexical_root / "spills"
+    document_dir.mkdir(parents=True, exist_ok=True)
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = dict(state.get("artifacts", {}))
+    document_index = int(state.get("document_index", 0))
+    documents_total = int(state.get("documents", 0))
+    source_documents = int(state.get("source_documents", 0))
+    documents: list[dict[str, Any]] = []
+    vocabulary = SpillVocabulary(
+        spill_dir,
+        config.lexical.spill_terms,
+        config.lexical.partitions,
+        index=int(state.get("vocabulary_index", 0)),
+        artifacts=artifacts,
+        artifact_root=root,
+    )
+    bigrams = _restore_bigram_state(config, root, state)
+    content_writer = EmbeddedContentWriter(
+        config,
+        root,
+        checkpoint_state=state.get("content") if state else None,
+    )
+    if state.get("scan_complete"):
+        return state, bigrams
+
+    d2 = SortedMembership(root / "d2_representatives.u64")
+    d3 = SortedMembership(root / "d3_representatives.u64")
+    candidates = sqlite3.connect(f"file:{root / 'boilerplate.sqlite'}?mode=ro", uri=True)
+    next_offset = int(state.get("next_offset", 0))
+    next_row = int(state.get("next_row", 0))
+    checkpoint = int(state.get("next_chunk", 0))
+    source_size = int(manifest["sources"]["pages"]["size"])
+    progress = ByteProgress("Tokenização lexical", source_size, initial=next_offset)
+    stop_requested = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        LOGGER.info("Léxico: SIGTERM recebido; fechando o checkpoint em andamento")
+
+    def flush_documents() -> None:
+        nonlocal documents, document_index
+        if not documents:
+            return
+        path = document_dir / f"documents-{document_index:06d}.parquet"
+        artifacts[str(path.relative_to(root))] = write_parquet_atomic(
+            path, documents, DOCUMENT_SCHEMA
+        )
+        document_index += 1
+        documents = []
+
+    def merge_batch(batch_results: list[dict[str, Any]]) -> None:
+        nonlocal documents_total, source_documents
+        for result in batch_results:
+            source_documents += 1
+            for variant in result["variants"]:
+                forms = variant["forms"]
+                lemmas = variant["lemmas"]
+                for view in variant["views"]:
+                    vocabulary.document(view, forms, lemmas)
+                    documents.append(
+                        {
+                            "row_number": result["row_number"],
+                            "view": view,
+                            "domain_id": result["domain_id"],
+                            "recursion_level": result["recursion_level"],
+                            "characters": variant["characters"],
+                            "words": len(forms),
+                            "numbers": variant["numbers"],
+                            "other_tokens": variant["other_tokens"],
+                        }
+                    )
+                    documents_total += 1
+                    if len(documents) >= 50_000:
+                        flush_documents()
+                if "B_clean" in variant["views"]:
+                    if variant["content"] is not None:
+                        content_writer.add_result(
+                            variant["content"], row_number=result["row_number"]
+                        )
+                    for bigram in variant["bigrams"]:
+                        bigrams.add(bigram)
+
+    def commit(scan_complete: bool) -> dict:
+        nonlocal checkpoint, document_index
+        flush_documents()
+        if scan_complete and document_index == 0:
+            path = document_dir / "documents-000000.parquet"
+            artifacts[str(path.relative_to(root))] = write_parquet_atomic(
+                path, [], DOCUMENT_SCHEMA
+            )
+            document_index = 1
+        vocabulary.flush()
+        if scan_complete and vocabulary.index == 0:
+            path = spill_dir / "spill-000000.parquet"
+            artifacts[str(path.relative_to(root))] = write_parquet_atomic(
+                path, [], SPILL_SCHEMA
+            )
+            vocabulary.index = 1
+        checkpoint += 1
+        content_state = content_writer.checkpoint(
+            identity,
+            next_offset=next_offset,
+            next_row=next_row,
+            complete=scan_complete,
+        )
+        for relative in tuple(artifacts):
+            if relative.startswith("content/trigram-state-"):
+                artifacts.pop(relative)
+        artifacts.update(content_state.get("artifacts", {}))
+        bigram_name, checksum = _write_bigram_state(root, checkpoint, bigrams)
+        for relative in tuple(artifacts):
+            if relative.startswith("lexical/bigram-state-"):
+                artifacts.pop(relative)
+        artifacts[str((lexical_root / bigram_name).relative_to(root))] = checksum
+        new_state = {
+            "schema_version": LEXICAL_STATE_SCHEMA_VERSION,
+            "snapshot_id": manifest["snapshot_id"],
+            "config_sha256": config.fingerprint,
+            "content_fingerprint": config.content_fingerprint,
+            "source_sha256": manifest["sources"]["pages"]["sha256"],
+            "spacy": identity,
+            "next_offset": next_offset,
+            "next_row": next_row,
+            "next_chunk": checkpoint,
+            "document_index": document_index,
+            "vocabulary_index": vocabulary.index,
+            "documents": documents_total,
+            "source_documents": source_documents,
+            "bigram_state": bigram_name,
+            "content": content_state,
+            "artifacts": dict(sorted(artifacts.items())),
+            "scan_complete": scan_complete,
+        }
+        atomic_json(lexical_root / "state.json", new_state)
+        progress.update(
+            next_offset,
+            detail=(
+                f"{config.runtime.workers} workers ativos; checkpoint {checkpoint:,}; "
+                f"{source_documents:,} documentos; offset confirmado {next_offset / 1048576:,.1f} MiB"
+            ),
+            force=True,
+        )
+        return new_state
+
+    batch: list[tuple] = []
+    batch_bytes = 0
+    batch_limit = max(1, min(LEXICAL_BATCH_BYTES, config.runtime.queue_bytes))
+    checkpoint_start = next_offset
+    reached_end = False
+
+    def submit_batch(pool: _OrderedBatchPool) -> None:
+        nonlocal batch, batch_bytes
+        if not batch:
+            return
+        for completed in pool.submit(batch, batch_bytes):
+            merge_batch(completed)
+        batch = []
+        batch_bytes = 0
+
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    try:
+        with _OrderedBatchPool(config, mode="lexical") as pool:
+            with config.analysis_pages.open("rb") as handle:
+                for record in iter_bounded_tsv(
+                    handle,
+                    columns=len(PAGES_COLUMNS),
+                    max_line_bytes=config.runtime.max_line_bytes,
+                    start_offset=next_offset,
+                    start_row=next_row,
+                    max_rows=config.runtime.max_rows,
+                ):
+                    if stop_requested:
+                        break
+                    next_offset = record.end_offset
+                    next_row = record.row_number
+                    progress.update(
+                        next_offset,
+                        detail=(
+                            f"{config.runtime.workers} workers ativos; checkpoint {checkpoint:,}; "
+                            f"{source_documents:,} documentos; linha {next_row:,}; "
+                            f"offset confirmado {checkpoint_start / 1048576:,.1f} MiB"
+                        ),
+                    )
+                    if record.fields is not None:
+                        fields = record.fields
+                        if decode_field(fields[11]) == "done":
+                            try:
+                                decoded = decode_text(
+                                    fields[13], fields[15], config.runtime.max_text_bytes
+                                )
+                            except TextDecodeFailure:
+                                decoded = None
+                            if decoded is not None and decoded.normalized:
+                                domain = parse_int(fields[1])
+                                level = parse_int(fields[10])
+                                is_d2 = d2.contains(record.row_number)
+                                is_d3 = d3.contains(record.row_number)
+                                views = ["R_valid"]
+                                if is_d2:
+                                    views.append("E_exact")
+                                variants: list[tuple[str, tuple[str, ...]]] = []
+                                if is_d3:
+                                    clean = clean_again(
+                                        config, candidates, domain, decoded.normalized
+                                    )
+                                    if clean:
+                                        if clean == decoded.normalized:
+                                            views.append("B_clean")
+                                        else:
+                                            variants.append((clean, ("B_clean",)))
+                                variants.append((decoded.normalized, tuple(views)))
+                                task = (
+                                    record.row_number,
+                                    domain,
+                                    level,
+                                    tuple(variants),
+                                )
+                                task_bytes = sum(4 * len(text) for text, _views in variants)
+                                if batch and batch_bytes + task_bytes > batch_limit:
+                                    submit_batch(pool)
+                                batch.append(task)
+                                batch_bytes += task_bytes
+                                if batch_bytes >= batch_limit or len(batch) >= 1024:
+                                    submit_batch(pool)
+                    if next_offset - checkpoint_start >= config.runtime.chunk_bytes:
+                        submit_batch(pool)
+                        for completed in pool.drain():
+                            merge_batch(completed)
+                        state = commit(False)
+                        checkpoint_start = next_offset
+                else:
+                    reached_end = True
+            submit_batch(pool)
+            for completed in pool.drain():
+                merge_batch(completed)
+        state = commit(reached_end and not stop_requested)
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        candidates.close()
+    if state["scan_complete"]:
+        progress.finish(detail="passagem lexical concluída")
+    else:
+        progress.finish(detail="checkpoint salvo; execução interrompida")
+    return state, bigrams
+
+
+def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
+    summary_path = root / "lexical_summary.json"
+    if summary_path.exists():
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    identity = spacy_identity(config)
     identity_path = root / "spacy.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise WackyWackyError("versão do spaCy/modelo difere da execução iniciada")
     atomic_json(identity_path, identity)
-    from .content import EmbeddedContentWriter
+    state = _load_or_reset_lexical_state(config, manifest, root, identity)
+    state, bigrams = _scan_lexical(config, manifest, root, identity, state)
+    if not state.get("scan_complete"):
+        return {"complete": False, "phase": "tokenization", "checkpoint": state}
 
-    content_writer = EmbeddedContentWriter(config, root)
-    d2 = SortedMembership(root / "d2_representatives.u64")
-    d3 = SortedMembership(root / "d3_representatives.u64")
-    candidate_path = root / "boilerplate.sqlite"
-    candidates = sqlite3.connect(f"file:{candidate_path}?mode=ro", uri=True)
-    document_dir = root / "lexical" / "documents"
-    spill_dir = root / "lexical" / "spills"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    spill_dir.mkdir(parents=True, exist_ok=True)
-    vocabulary = SpillVocabulary(spill_dir, config.lexical.spill_terms, config.lexical.partitions)
-    bigrams = SpaceSaving(config.lexical.bigram_candidates)
-    documents: list[dict] = []
-    document_chunk = 0
-    jobs: list[tuple[int, int | None, int | None, str, tuple[str, ...]]] = []
-    job_bytes = 0
-    progress = ByteProgress(
-        "Tokenização lexical",
-        manifest["sources"]["pages"]["size"],
-    )
-
-    def emit(
-        view: str,
-        row: int,
-        domain: int | None,
-        level: int | None,
-        text: str,
-        document,
-    ) -> None:
-        nonlocal document_chunk, documents
-        forms, lemmas, numbers, other, _words = _token_data(document)
-        if view == "B_clean":
-            content_writer.add(row, domain, level, text, document)
-            for words in _paragraph_word_sequences(document, text):
-                for left, right in pairwise(words):
-                    bigrams.add(left + "\t" + right)
-        vocabulary.document(view, forms, lemmas)
-        documents.append(
-            {
-                "row_number": row,
-                "view": view,
-                "domain_id": domain,
-                "recursion_level": level,
-                "characters": len(text),
-                "words": len(forms),
-                "numbers": numbers,
-                "other_tokens": other,
-            }
-        )
-        if len(documents) >= 50_000:
-            write_parquet_atomic(
-                document_dir / f"documents-{document_chunk:06d}.parquet", documents, DOCUMENT_SCHEMA
-            )
-            document_chunk += 1
-            documents = []
-
-    def flush_jobs() -> None:
-        nonlocal jobs, job_bytes
-        if not jobs:
-            return
-        for job in jobs:
-            row, domain, level, text, views = job
-            document = _parse_document(nlp, text)
-            for view in views:
-                emit(view, row, domain, level, text, document)
-        jobs = []
-        job_bytes = 0
-
-    def add_job(
-        row: int,
-        domain: int | None,
-        level: int | None,
-        text: str,
-        views: tuple[str, ...],
-    ) -> None:
-        nonlocal job_bytes
-        jobs.append((row, domain, level, text, views))
-        job_bytes += 4 * len(text)
-        if job_bytes >= _nlp_queue_bytes(config) or len(jobs) >= 1024:
-            flush_jobs()
-
-    with config.analysis_pages.open("rb") as handle:
-        for record in iter_bounded_tsv(
-            handle,
-            columns=len(PAGES_COLUMNS),
-            max_line_bytes=config.runtime.max_line_bytes,
-            max_rows=config.runtime.max_rows,
-        ):
-            progress.update(record.end_offset, detail=f"linha {record.row_number:,}")
-            if record.fields is None:
-                continue
-            fields = record.fields
-            if decode_field(fields[11]) != "done":
-                continue
-            try:
-                decoded = decode_text(fields[13], fields[15], config.runtime.max_text_bytes)
-            except TextDecodeFailure:
-                continue
-            if not decoded.normalized:
-                continue
-            domain = parse_int(fields[1])
-            level = parse_int(fields[10])
-            is_d2 = d2.contains(record.row_number)
-            is_d3 = d3.contains(record.row_number)
-            views = ["R_valid"]
-            if is_d2:
-                views.append("E_exact")
-            if is_d3:
-                clean = clean_again(config, candidates, domain, decoded.normalized)
-                if clean:
-                    if clean == decoded.normalized:
-                        views.append("B_clean")
-                    else:
-                        add_job(record.row_number, domain, level, clean, ("B_clean",))
-            add_job(record.row_number, domain, level, decoded.normalized, tuple(views))
-    flush_jobs()
-    progress.finish(detail="primeira passagem concluída")
-    candidates.close()
-    if documents or document_chunk == 0:
-        write_parquet_atomic(
-            document_dir / f"documents-{document_chunk:06d}.parquet", documents, DOCUMENT_SCHEMA
-        )
-    vocabulary.flush()
-    content_writer.finish(identity, manifest["sources"]["pages"]["size"])
+    lexical_root = root / "lexical"
+    spill_dir = lexical_root / "spills"
+    document_dir = lexical_root / "documents"
     LOGGER.info("Léxico: reduzindo partições de vocabulário no DuckDB")
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
@@ -464,6 +934,7 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
                sum(document_frequency)::UBIGINT AS document_frequency,
                bool_or(is_stop) AS is_stop
         FROM read_parquet('{spill_glob}') GROUP BY partition, view, kind, term
+        ORDER BY partition, view, kind, term
         """,
         root / "vocabulary.parquet",
     )
@@ -491,15 +962,14 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
         [str(root / "vocabulary.parquet")],
     ).fetchall()
     connection.close()
-    candidates_path = root / "bigram_candidates.json"
     atomic_json(
-        candidates_path,
+        root / "bigram_candidates.json",
         {
             "omitted_upper_bound": bigrams.omitted_upper_bound,
             "items": len(bigrams.values),
         },
     )
-    write_parquet_atomic(
+    candidate_checksum = write_parquet_atomic(
         root / "bigram_candidates.parquet",
         [
             {
@@ -513,8 +983,15 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
     )
     LOGGER.info("Léxico: iniciando recontagem exata dos bigramas candidatos")
     bigram_summary = recount_bigrams(
-        config, root, nlp, set(bigrams.values), bigrams.omitted_upper_bound
+        config,
+        manifest,
+        root,
+        set(bigrams.values),
+        bigrams.omitted_upper_bound,
+        candidate_checksum,
     )
+    if bigram_summary.get("complete") is False:
+        return {"complete": False, "phase": "bigram_recount", "checkpoint": bigram_summary}
     if not bigram_summary["certified"]:
         raise WackyWackyError(
             "top-K de bigramas não certificado; aumente lexical.bigram_candidates e retome"
@@ -549,61 +1026,206 @@ def lexical_pass(config: Config, manifest: dict, root: Path) -> dict:
     return summary
 
 
-def recount_bigrams(config: Config, root: Path, nlp, wanted: set[str], upper_bound: int) -> dict:
-    counts = Counter()
-    documents = Counter()
-    jobs: list[str] = []
-    job_bytes = 0
-    progress = ByteProgress("Recontagem de bigramas", config.analysis_pages.stat().st_size)
-
-    def flush() -> None:
-        nonlocal jobs, job_bytes
-        if not jobs:
-            return
-        for clean in jobs:
-            document = nlp.make_doc(clean)
-            seen: set[str] = set()
-            for words in _paragraph_word_sequences(document, clean):
-                for left, right in pairwise(words):
-                    key = left + "\t" + right
-                    if key in wanted:
-                        counts[key] += 1
-                        seen.add(key)
-            documents.update(seen)
-        jobs = []
-        job_bytes = 0
-
-    for item in iter_bclean(config, root):
-        progress.update(
-            item.source.end_offset, detail=f"linha {item.source.row_number:,}"
+def recount_bigrams(
+    config: Config,
+    manifest: dict,
+    root: Path,
+    wanted: set[str],
+    upper_bound: int,
+    candidate_checksum: str,
+) -> dict:
+    recount_root = root / "lexical" / "bigram-recount"
+    state_path = recount_root / "state.json"
+    state = read_json(state_path, {})
+    compatible = bool(
+        state.get("schema_version") == BIGRAM_RECOUNT_STATE_SCHEMA_VERSION
+        and state.get("snapshot_id") == manifest["snapshot_id"]
+        and state.get("config_sha256") == config.fingerprint
+        and state.get("candidate_checksum") == candidate_checksum
+        and state.get("source_sha256") == manifest["sources"]["pages"]["sha256"]
+    )
+    if state and (not compatible or not _checkpoint_artifacts_valid(root, state.get("artifacts", {}))):
+        LOGGER.info("Recontagem: descartando estado incompatível ou checksum inválido")
+        shutil.rmtree(recount_root, ignore_errors=True)
+        state = {}
+    elif not state and recount_root.exists():
+        shutil.rmtree(recount_root, ignore_errors=True)
+    recount_root.mkdir(parents=True, exist_ok=True)
+    next_offset = int(state.get("next_offset", 0))
+    next_row = int(state.get("next_row", 0))
+    checkpoint = int(state.get("next_chunk", 0))
+    documents_total = int(state.get("documents", 0))
+    artifacts = dict(state.get("artifacts", {}))
+    _discard_indexed_files(recount_root, "chunk", checkpoint)
+    for partial in recount_root.glob("*.partial"):
+        partial.unlink(missing_ok=True)
+    if state.get("complete"):
+        LOGGER.info(
+            "Recontagem: reutilizando %s checkpoints confirmados", f"{checkpoint:,}"
         )
-        jobs.append(item.text)
-        job_bytes += 4 * len(item.text)
-        if job_bytes >= _nlp_queue_bytes(config) or len(jobs) >= 1024:
-            flush()
-    flush()
-    progress.update(config.analysis_pages.stat().st_size)
-    progress.finish(detail="segunda passagem concluída")
-    rows = [
+    else:
+        if state:
+            LOGGER.info(
+                "Recontagem: retomando offset %s, linha %s, checkpoint %s",
+                f"{next_offset:,}",
+                f"{next_row:,}",
+                f"{checkpoint:,}",
+            )
+        progress = ByteProgress(
+            "Recontagem de bigramas",
+            int(manifest["sources"]["pages"]["size"]),
+            initial=next_offset,
+        )
+        counts: Counter[str] = Counter()
+        documents: Counter[str] = Counter()
+        batch: list[str] = []
+        batch_bytes = 0
+        batch_limit = max(1, min(LEXICAL_BATCH_BYTES, config.runtime.queue_bytes))
+        checkpoint_start = next_offset
+        stop_requested = False
+        reached_end = False
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            nonlocal stop_requested
+            stop_requested = True
+            LOGGER.info("Recontagem: SIGTERM recebido; fechando checkpoint")
+
+        def merge(result: dict[str, Counter]) -> None:
+            counts.update(result["counts"])
+            documents.update(result["documents"])
+
+        def submit(pool: _OrderedBatchPool) -> None:
+            nonlocal batch, batch_bytes
+            if not batch:
+                return
+            for completed in pool.submit(batch, batch_bytes):
+                merge(completed)
+            batch = []
+            batch_bytes = 0
+
+        def commit(complete: bool) -> dict:
+            nonlocal checkpoint, counts, documents
+            path = recount_root / f"chunk-{checkpoint:06d}.parquet"
+            artifacts[str(path.relative_to(root))] = write_parquet_atomic(
+                path,
+                [
+                    {
+                        "bigram": term,
+                        "total_frequency": frequency,
+                        "document_frequency": documents[term],
+                    }
+                    for term, frequency in sorted(counts.items())
+                ],
+                BIGRAM_RECOUNT_SCHEMA,
+            )
+            checkpoint += 1
+            counts = Counter()
+            documents = Counter()
+            new_state = {
+                "schema_version": BIGRAM_RECOUNT_STATE_SCHEMA_VERSION,
+                "snapshot_id": manifest["snapshot_id"],
+                "config_sha256": config.fingerprint,
+                "candidate_checksum": candidate_checksum,
+                "source_sha256": manifest["sources"]["pages"]["sha256"],
+                "next_offset": next_offset,
+                "next_row": next_row,
+                "next_chunk": checkpoint,
+                "documents": documents_total,
+                "artifacts": dict(sorted(artifacts.items())),
+                "complete": complete,
+            }
+            atomic_json(state_path, new_state)
+            progress.update(
+                next_offset,
+                detail=(
+                    f"{config.runtime.workers} workers ativos; checkpoint {checkpoint:,}; "
+                    f"{documents_total:,} documentos; offset confirmado {next_offset / 1048576:,.1f} MiB"
+                ),
+                force=True,
+            )
+            return new_state
+
+        previous_term = signal.signal(signal.SIGTERM, request_stop)
+        try:
+            with _OrderedBatchPool(config, mode="recount", wanted=wanted) as pool:
+                for item in iter_bclean(
+                    config, root, start_offset=next_offset, start_row=next_row
+                ):
+                    if stop_requested:
+                        break
+                    next_offset = item.source.end_offset
+                    next_row = item.source.row_number
+                    documents_total += 1
+                    size = 4 * len(item.text)
+                    if batch and batch_bytes + size > batch_limit:
+                        submit(pool)
+                    batch.append(item.text)
+                    batch_bytes += size
+                    if batch_bytes >= batch_limit or len(batch) >= 1024:
+                        submit(pool)
+                    progress.update(
+                        next_offset,
+                        detail=(
+                            f"{config.runtime.workers} workers ativos; checkpoint {checkpoint:,}; "
+                            f"{documents_total:,} documentos; linha {next_row:,}; "
+                            f"offset confirmado {checkpoint_start / 1048576:,.1f} MiB"
+                        ),
+                    )
+                    if next_offset - checkpoint_start >= config.runtime.chunk_bytes:
+                        submit(pool)
+                        for completed in pool.drain():
+                            merge(completed)
+                        state = commit(False)
+                        checkpoint_start = next_offset
+                else:
+                    reached_end = True
+                submit(pool)
+                for completed in pool.drain():
+                    merge(completed)
+            if reached_end:
+                next_offset = int(manifest["sources"]["pages"]["size"])
+            state = commit(reached_end and not stop_requested)
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+        if not state.get("complete"):
+            progress.finish(detail="checkpoint salvo; execução interrompida")
+            return {"complete": False, **state}
+        progress.finish(detail="recontagem concluída")
+
+    LOGGER.info("Recontagem: reduzindo checkpoints exatos no DuckDB")
+    connection = duckdb_connection(
+        root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
+    )
+    recount_glob = str(recount_root / "chunk-*.parquet").replace("'", "''")
+    rows = connection.execute(
+        f"""
+        SELECT bigram, sum(total_frequency)::UBIGINT AS total_frequency,
+               sum(document_frequency)::UBIGINT AS document_frequency
+        FROM read_parquet('{recount_glob}')
+        GROUP BY bigram ORDER BY total_frequency DESC, bigram
+        """
+    ).fetchall()
+    connection.close()
+    stop_words = _load_nlp(config).Defaults.stop_words
+    output = [
         {
             "bigram": term,
             "total_frequency": frequency,
-            "document_frequency": documents[term],
+            "document_frequency": document_frequency,
             "contains_stopword": any(
-                component in nlp.Defaults.stop_words for component in term.split("\t")
+                component in stop_words for component in term.split("\t")
             ),
         }
-        for term, frequency in counts.most_common()
+        for term, frequency, document_frequency in rows
     ]
-    write_parquet_atomic(root / "bigrams.parquet", rows, BIGRAM_SCHEMA)
+    write_parquet_atomic(root / "bigrams.parquet", output, BIGRAM_SCHEMA)
     published = config.lexical.published_items
-    eligible = [row for row in rows if not row["contains_stopword"]]
+    eligible = [row for row in output if not row["contains_stopword"]]
     last = eligible[min(published, len(eligible)) - 1]["total_frequency"] if eligible else 0
-    certified = upper_bound < last
     return {
         "candidates": len(wanted),
         "omitted_upper_bound": upper_bound,
         "published_k": min(published, len(eligible)),
         "last_frequency": last,
-        "certified": certified,
+        "certified": upper_bound < last,
     }

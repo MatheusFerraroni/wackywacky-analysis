@@ -85,7 +85,10 @@ def run_pipeline(config: Config, *, resume: bool) -> dict:
     _stage(state_path, state, "clean")
     with logged_stage("[7/12] Estatísticas lexicais"):
         lexical = lexical_pass(config, manifest, root)
-        assert_snapshot(config, manifest)
+    if lexical.get("complete") is False:
+        _stage(state_path, state, "interrupted")
+        return {"snapshot_id": manifest["snapshot_id"], "status": "interrupted"}
+    assert_snapshot(config, manifest)
     _stage(state_path, state, "lexical")
     with logged_stage("[8/12] Estrutura e conteúdo textual"):
         content = content_pass(config, manifest, root)

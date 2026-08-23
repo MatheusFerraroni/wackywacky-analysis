@@ -113,7 +113,8 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
 def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) -> None:
     pages, domains = write_sources(tmp_path / "sources")
     summaries = []
-    for workers in (1, 2):
+    parquet_checksums = []
+    for workers in (1, 2, 8):
         base = tmp_path / f"run-{workers}"
         config = load_config(
             write_config(
@@ -141,7 +142,14 @@ def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) ->
                 for key in ("domains", "exact", "clean", "lexical", "content")
             }
         )
-    assert summaries[0] == summaries[1]
+        parquet_checksums.append(
+            {
+                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                for name in ("vocabulary.parquet", "bigram_candidates.parquet", "bigrams.parquet")
+            }
+        )
+    assert summaries[0] == summaries[1] == summaries[2]
+    assert parquet_checksums[0] == parquet_checksums[1] == parquet_checksums[2]
 
 
 def test_official_portuguese_model_is_pinned_and_keeps_lemmatizer(tmp_path: Path) -> None:

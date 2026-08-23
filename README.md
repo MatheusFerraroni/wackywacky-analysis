@@ -41,6 +41,8 @@ uv run wackywacky run --config configs/full.toml
 
 Em terminal interativo, o comando usa barras `tqdm` com velocidade e ETA; quando redirecionado, grava o mesmo progresso periodicamente no `stderr`. O JSON final permanece isolado no `stdout`.
 
+No perfil `full`, a etapa lexical usa `runtime.workers` processos persistentes e confirma um checkpoint a cada `runtime.chunk_bytes`. `--resume` reaproveita o último offset confirmado tanto na tokenização quanto na recontagem de bigramas; um estado lexical antigo é descartado sem afetar D1, D2, revisão, limpeza ou D3.
+
 Após o léxico, `run` caracteriza somente `B_clean`: estrutura de frases e parágrafos, diversidade lexical, classes gramaticais, repetição interna, sinais textuais, colocações e variação entre domínios. A etapa possui checkpoint próprio; `--resume` complementa snapshots antigos sem refazer inventário, deduplicação ou revisão.
 
 Quando houver candidatos intradomínio, `run` termina com código 2 e grava a amostra privada em `work/`. Rotule cada item como `boilerplate`, `conteúdo` ou `incerto`:
