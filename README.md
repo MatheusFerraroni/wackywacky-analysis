@@ -66,6 +66,8 @@ uv run wackywacky render --config configs/full.toml --snapshot-id SNAPSHOT_ID
 
 Alterações apenas no estilo das figuras continuam exigindo somente `render`. Alterações nas métricas de `[content]` retomam apenas a análise de conteúdo.
 
+Resultados concluídos no servidor podem ser consultados localmente, somente para leitura, com `./mount_remote_results.sh`. Use os subcomandos `status`, `verify` e `unmount`; o mount fica fora do checkout Git.
+
 ## Validação local
 
 ```bash
