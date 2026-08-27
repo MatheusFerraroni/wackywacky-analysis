@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 PAGE_PROJECTION = frozenset({0, 1, 2, 3, 8, 10, 11, 12, 13, 15})
-DOMAIN_PROJECTION = frozenset({0, 1, 3, 4, 5, 6})
+DOMAIN_PROJECTION = frozenset({0, 1, 3, 4, 5})
 
 
 @dataclass(frozen=True)

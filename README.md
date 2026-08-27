@@ -6,7 +6,8 @@ Pacote independente para caracterizar cópias imutáveis de `pages.tsv` e `domai
 
 - `R_valid`: páginas `done` com texto hexadecimal/Zstandard/UTF-8 válido e não vazio.
 - `E_exact`: `R_valid` após deduplicação exata normalizada.
-- `B_clean`: `E_exact` após remoção intradomínio aprovada por revisão e nova deduplicação. É a visão lexical principal.
+- `B_clean`: `E_exact` após remoção intradomínio aprovada e deduplicação D3.
+- `B_clean_v2`: `B_clean` após regras estruturais confirmadas e deduplicação D4. É a visão principal; `B_clean` permanece comparável.
 - `N_near`: sensibilidade opcional por MinHash e Jaccard; não altera `B_clean`.
 
 ## Instalação
@@ -45,6 +46,16 @@ No perfil `full`, a etapa lexical usa `runtime.workers` processos persistentes e
 
 Após o léxico, `run` caracteriza somente `B_clean`: estrutura de frases e parágrafos, diversidade lexical, classes gramaticais, repetição interna, sinais textuais, colocações e variação entre domínios. A etapa possui checkpoint próprio; `--resume` complementa snapshots antigos sem refazer inventário, deduplicação ou revisão.
 
+Com `[boilerplate_v2].enabled=true`, candidatos residuais são descobertos em `B_clean`. Confirme a sugestão padrão ou marque exceções e retome:
+
+```bash
+uv run wackywacky review export --config configs/full.toml --stage v2
+uv run wackywacky review import --config configs/full.toml --stage v2 --input /caminho/revisao-v2.csv
+uv run wackywacky run --config configs/full.toml --resume
+```
+
+A confirmação v2 não é tratada como medida de precisão. Léxico e conteúdo v2 são coletados juntos; bigramas e trigramas são recontados em uma única passagem retomável.
+
 Quando houver candidatos intradomínio, `run` termina com código 2 e grava a amostra privada em `work/`. Rotule cada item como `boilerplate`, `conteúdo` ou `incerto`:
 
 O CSV mantém um item por linha física, mostra quebras internas como `[QUEBRA]` e começa por `sample_id` e `frequencia`. Todo `label` começa como `boilerplate`; altere somente as exceções para `conteúdo` ou `incerto`. Prévias longas são reduzidas de forma explícita.
@@ -60,9 +71,10 @@ Comandos independentes:
 ```bash
 uv run wackywacky near-duplicates --config configs/full.toml
 uv run wackywacky render --config configs/full.toml --snapshot-id SNAPSHOT_ID
+uv run wackywacky refresh --config configs/full.toml --snapshot-id SNAPSHOT_ID
 ```
 
-`render` lê somente agregados. Scratch, Parquet, bancos e revisão privada ficam ignorados; `results/<snapshot-id>/` contém apenas manifests, tabelas e figuras publicáveis.
+`refresh` corrige inventário, tabelas e figuras sem repetir as passagens textuais; a primeira saída existente é preservada em `revisions/method-v1/`. `render` lê somente agregados.
 
 Alterações apenas no estilo das figuras continuam exigindo somente `render`. Alterações nas métricas de `[content]` retomam apenas a análise de conteúdo.
 

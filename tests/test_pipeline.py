@@ -11,7 +11,7 @@ from conftest import domain_row, page_row, write_config, write_sources
 from wackywacky_analysis.config import load_config
 from wackywacky_analysis.errors import ReviewRequired, WackyWackyError
 from wackywacky_analysis.near import run_near_duplicates
-from wackywacky_analysis.pipeline import run_pipeline
+from wackywacky_analysis.pipeline import refresh_reports, run_pipeline
 from wackywacky_analysis.review import export_review, import_review
 from wackywacky_analysis.snapshot import verify_snapshot
 
@@ -76,6 +76,7 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
     assert page_metrics["md5_class"]["invalid"] == 1
     assert page_metrics["md5_class"]["missing"] == 1
     assert summary["exact"]["missing_domain_references"] == 1
+    assert summary["domains"]["requests"] == 220
     assert summary["clean"]["documents_affected"] >= 6
     vocabulary = summary["lexical"]["vocabulary"]
     for value in vocabulary.values():
@@ -87,12 +88,15 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
     assert (result / "tables" / "21_cobertura_vocabulario.csv").is_file()
     assert (result / "figures" / "10_estrutura_textual.svg").is_file()
     assert (result / "figures" / "17_cobertura_vocabulario.svg").is_file()
+    with (result / "tables" / "03_status_explorados.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        explored = {row["status_explorado"] for row in csv.DictReader(handle)}
+    assert explored == {"done", "failed", "blocked_language"}
     with (result / "tables" / "19_colocacoes.csv").open(encoding="utf-8", newline="") as handle:
         collocations = list(csv.DictReader(handle))
     assert all(
-        -1 <= float(row["NPMI"]) <= 1
-        for row in collocations
-        if row["ranking"] == "bigrama_NPMI"
+        -1 <= float(row["NPMI"]) <= 1 for row in collocations if row["ranking"] == "bigrama_NPMI"
     )
     public = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
@@ -108,6 +112,50 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
     near = run_near_duplicates(config, root)
     assert near["confirmed_pairs"] >= 1
     assert near["documents_removed_in_sensitivity"] >= 1
+
+
+def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts(
+    tmp_path: Path,
+) -> None:
+    pages, domains = write_sources(tmp_path)
+    config = load_config(
+        write_config(
+            tmp_path / "config.toml", pages, domains, tmp_path / "work", tmp_path / "results"
+        )
+    )
+    with pytest.raises(ReviewRequired):
+        run_pipeline(config, resume=False)
+    manifest = verify_snapshot(config)
+    root = config.paths.work / manifest["snapshot_id"]
+    sample = root / "review" / "boilerplate-review.csv"
+    import_review(config, root, sample)
+    result = Path(run_pipeline(config, resume=True)["result"])
+    scientific = (
+        "d1_groups.parquet",
+        "d2_groups.parquet",
+        "d3_groups.parquet",
+        "vocabulary.parquet",
+        "bigrams.parquet",
+        "content_histograms.parquet",
+    )
+    before = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in scientific}
+    (root / "domains.parquet").write_bytes((root / "domains-v2.parquet").read_bytes())
+    (root / "domain_summary.json").write_text('{"schema_version":1,"requests":0}')
+    (root / "domains-v2.parquet").unlink()
+    (root / "domains-v2.parquet.sha256").unlink()
+    (root / "domain_summary-v2.json").unlink()
+    refreshed = refresh_reports(config, manifest["snapshot_id"])
+    assert refreshed["status"] == "refreshed"
+    assert (result / "revisions" / "method-v1" / "summary.json").is_file()
+    summary = json.loads((result / "summary.json").read_text())
+    assert summary["domains"]["schema_version"] == 2
+    assert summary["domains"]["requests"] == 220
+    assert "nan" not in "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore").casefold()
+        for path in result.rglob("*.csv")
+    )
+    after = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in scientific}
+    assert before == after
 
 
 def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) -> None:
@@ -137,10 +185,7 @@ def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) ->
         result = Path(run_pipeline(config, resume=True)["result"])
         summary = json.loads((result / "summary.json").read_text())
         summaries.append(
-            {
-                key: summary[key]
-                for key in ("domains", "exact", "clean", "lexical", "content")
-            }
+            {key: summary[key] for key in ("domains", "exact", "clean", "lexical", "content")}
         )
         parquet_checksums.append(
             {

@@ -52,6 +52,25 @@ class Boilerplate:
 
 
 @dataclass(frozen=True)
+class BoilerplateV2:
+    enabled: bool = False
+    short_line_min_chars: int = 3
+    short_line_max_chars: int = 79
+    short_line_min_alpha_tokens: int = 2
+    short_line_max_words: int = 12
+    short_pair_min_chars: int = 6
+    short_pair_max_chars: int = 159
+    edge_fraction: float = 0.10
+    edge_min_lines: int = 3
+    frequency_fraction: float = 0.01
+    frequency_min_documents: int = 20
+    review_mediawiki: int = 100
+    review_lines: int = 100
+    review_pairs: int = 100
+    review_seed: int = 73_129
+
+
+@dataclass(frozen=True)
 class Lexical:
     spacy_model: str
     partitions: int
@@ -117,6 +136,7 @@ class Config:
     runtime: Runtime
     source: Source
     boilerplate: Boilerplate
+    boilerplate_v2: BoilerplateV2
     lexical: Lexical
     content: Content
     near_duplicates: NearDuplicates
@@ -136,6 +156,7 @@ class Config:
         # inventário, deduplicação ou revisão humana.
         value = self.public_dict()
         value.pop("content", None)
+        value.pop("boilerplate_v2", None)
         payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -143,6 +164,21 @@ class Config:
     def content_fingerprint(self) -> str:
         payload = json.dumps(
             {"schema_version": 2, "content": asdict(self.content)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @property
+    def v2_fingerprint(self) -> str:
+        from .noise import MEDIAWIKI_RULESET_VERSION
+
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "boilerplate_v2": asdict(self.boilerplate_v2),
+                "mediawiki_ruleset_version": MEDIAWIKI_RULESET_VERSION,
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -201,6 +237,7 @@ def load_config(path: str | Path) -> Config:
             runtime=Runtime(**raw["runtime"]),
             source=Source(**raw["source"]),
             boilerplate=Boilerplate(**raw["boilerplate"]),
+            boilerplate_v2=BoilerplateV2(**raw.get("boilerplate_v2", {})),
             lexical=Lexical(**raw["lexical"]),
             content=Content(**raw.get("content", {})),
             near_duplicates=NearDuplicates(**raw["near_duplicates"]),
@@ -300,3 +337,23 @@ def _validate(config: Config) -> None:
         raise ConfigurationError("parâmetros de boilerplate devem ser positivos")
     if not (0 <= boilerplate.precision_min <= 1 and 0 <= boilerplate.wilson_lower_min <= 1):
         raise ConfigurationError("limiares de revisão devem estar em [0, 1]")
+    v2 = config.boilerplate_v2
+    if (
+        min(
+            v2.short_line_min_chars,
+            v2.short_line_min_alpha_tokens,
+            v2.short_line_max_words,
+            v2.short_pair_min_chars,
+            v2.edge_min_lines,
+            v2.frequency_min_documents,
+            v2.review_mediawiki,
+            v2.review_lines,
+            v2.review_pairs,
+        )
+        <= 0
+        or v2.short_line_max_chars < v2.short_line_min_chars
+        or v2.short_pair_max_chars < v2.short_pair_min_chars
+        or not 0 < v2.edge_fraction <= 0.5
+        or not 0 < v2.frequency_fraction <= 1
+    ):
+        raise ConfigurationError("parâmetros de boilerplate_v2 inválidos")

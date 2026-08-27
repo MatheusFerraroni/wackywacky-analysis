@@ -72,6 +72,8 @@ def render_all(result: Path) -> None:
     _levels(data, figures)
     _zipf(data, figures)
     _top(data, figures)
+    if (data / "principais_termos_sem_interface.csv").exists():
+        _top_filtered(data, figures)
     if (data / "estrutura_textual.csv").exists():
         _content_structure(data, figures)
         _content_diversity(data, figures)
@@ -112,7 +114,10 @@ def _length_ecdf(data: Path, output: Path) -> None:
     for row in rows:
         groups[row["visao"]].append((int(row["palavras"]), int(row["documentos"])))
     fig, ax = plt.subplots()
-    for view, color in (("R_valid", BLUE), ("B_clean", ORANGE)):
+    styles = (("R_valid", BLUE), ("B_clean", ORANGE), ("B_clean_v2", GREEN))
+    for view, color in styles:
+        if view not in groups:
+            continue
         points = groups[view]
         total = sum(count for _words, count in points)
         cumulative = np.cumsum([count for _words, count in points]) / total if total else []
@@ -132,16 +137,23 @@ def _length_ecdf(data: Path, output: Path) -> None:
 
 
 def _removal_ecdf(data: Path, output: Path) -> None:
-    rows = _read(data / "fracao_removida.csv")
-    counts = [int(row["documentos"]) for row in rows]
-    total = sum(counts)
     fig, ax = plt.subplots()
-    ax.step(
-        [float(row["fracao"]) for row in rows],
-        np.cumsum(counts) / total if total else [],
-        where="post",
-        color=ORANGE,
-    )
+    series = [("B_clean", data / "fracao_removida.csv", ORANGE)]
+    if (data / "fracao_removida_v2.csv").exists():
+        series.append(("B_clean_v2 adicional", data / "fracao_removida_v2.csv", GREEN))
+    for label, path, color in series:
+        rows = _read(path)
+        counts = [int(row["documentos"]) for row in rows]
+        total = sum(counts)
+        ax.step(
+            [float(row["fracao"]) for row in rows],
+            np.cumsum(counts) / total if total else [],
+            where="post",
+            color=color,
+            label=label,
+        )
+    if len(series) > 1:
+        ax.legend()
     ax.set_xlabel("Fração de caracteres removida")
     ax.set_ylabel("Fração acumulada de documentos")
     ax.set_title("Impacto dos fragmentos repetidos intradomínio")
@@ -154,7 +166,9 @@ def _cluster_ccdf(data: Path, output: Path) -> None:
     for row in rows:
         groups[row["etapa"]].append((int(row["tamanho"]), int(row["grupos"])))
     fig, ax = plt.subplots()
-    for stage, color in (("D2", BLUE), ("D3", GREEN)):
+    for stage, color in (("D2", BLUE), ("D3", GREEN), ("D4", ORANGE)):
+        if stage not in groups:
+            continue
         points = sorted(groups[stage])
         remaining = np.cumsum([count for _size, count in reversed(points)])[::-1]
         ax.step(
@@ -226,7 +240,7 @@ def _zipf(data: Path, output: Path) -> None:
     ax.set_xlabel("Posição no vocabulário")
     ax.set_ylabel("Frequência")
     ax.legend()
-    ax.set_title("Curva de Zipf em B_clean")
+    ax.set_title("Curva de Zipf na visão principal")
     _save(fig, output, "08_zipf")
 
 
@@ -253,11 +267,35 @@ def _top(data: Path, output: Path) -> None:
     _save(fig, output, "09_principais_palavras_bigramas")
 
 
+def _top_filtered(data: Path, output: Path) -> None:
+    words = _read(data / "principais_termos_sem_interface.csv")[-30:]
+    bigrams = _read(data / "principais_bigramas_sem_interface.csv")[-30:]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 7))
+    axes[0].barh(
+        [row["item"] for row in reversed(words)],
+        [int(row["frequencia"]) for row in reversed(words)],
+        color=BLUE,
+    )
+    axes[0].set_title("Palavras sem stopwords e interface explícita")
+    axes[1].barh(
+        [row["item"] for row in reversed(bigrams)],
+        [int(row["frequencia"]) for row in reversed(bigrams)],
+        color=GREEN,
+    )
+    axes[1].set_title("Bigramas sem interface explícita")
+    for ax in axes:
+        ax.set_xlabel("Frequência")
+    fig.suptitle("Filtro visual; não altera B_clean")
+    _save(fig, output, "09b_principais_palavras_bigramas_sem_interface")
+
+
 def _weighted_ecdf(ax, rows: list[dict[str, str]], label: str, color: str) -> None:
     values = [float(row["valor"]) for row in rows]
     counts = [int(row.get("unidades", row.get("documentos", "0"))) for row in rows]
     total = sum(counts)
-    ax.step(values, np.cumsum(counts) / total if total else [], where="post", label=label, color=color)
+    ax.step(
+        values, np.cumsum(counts) / total if total else [], where="post", label=label, color=color
+    )
 
 
 def _content_structure(data: Path, output: Path) -> None:
@@ -316,9 +354,7 @@ def _content_repetition(data: Path, output: Path) -> None:
         ("paragrafos", "Parágrafos", ORANGE),
     ):
         selected = [row for row in rows if row["unidade"] == unit]
-        normalized = [
-            {"valor": row["fracao"], "documentos": row["documentos"]} for row in selected
-        ]
+        normalized = [{"valor": row["fracao"], "documentos": row["documentos"]} for row in selected]
         _weighted_ecdf(ax, normalized, label, color)
     ax.set_xlabel("Fração de palavras em unidades repetidas")
     ax.set_ylabel("Fração acumulada de documentos")
@@ -328,9 +364,7 @@ def _content_repetition(data: Path, output: Path) -> None:
 
 
 def _content_signals(data: Path, output: Path) -> None:
-    rows = sorted(
-        _read(data / "sinais_textuais.csv"), key=lambda row: float(row["participacao"])
-    )
+    rows = sorted(_read(data / "sinais_textuais.csv"), key=lambda row: float(row["participacao"]))
     labels = {
         "frases_fragmentadas": "frases fragmentadas",
         "frases_longas": "frases longas",

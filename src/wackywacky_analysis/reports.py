@@ -3,11 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
 from .config import Config
-from .io import atomic_json, sha256_file
+from .io import atomic_json, read_json, sha256_file
+from .noise import MEDIAWIKI_RULESET_VERSION, is_presentation_noise
 from .storage import duckdb_connection
 
 
@@ -56,6 +59,10 @@ def build_reports(
     lexical: dict,
     content: dict,
     root: Path,
+    *,
+    clean_v2: dict | None = None,
+    lexical_v2: dict | None = None,
+    content_v2: dict | None = None,
 ) -> Path:
     result = config.paths.results / manifest["snapshot_id"]
     tables = result / "tables"
@@ -64,6 +71,9 @@ def build_reports(
     review_gate = json.loads((root / "review_gate.json").read_text(encoding="utf-8"))
     invariants = json.loads((root / "invariants.json").read_text(encoding="utf-8"))
     sampled = bool(manifest.get("sampling", {}).get("enabled"))
+    has_v2 = bool(clean_v2 and lexical_v2 and content_v2)
+    main_root = root / "v2" if has_v2 else root
+    main_view = "B_clean_v2" if has_v2 else "B_clean"
     public_manifest = {
         **manifest,
         "sources": {
@@ -73,7 +83,7 @@ def build_reports(
     }
     atomic_json(result / "manifest.json", public_manifest)
     methods = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": (
             "prévia amostral não representativa" if sampled else "snapshot integral configurado"
         ),
@@ -81,6 +91,10 @@ def build_reports(
             "R_valid": "done com texto hexadecimal/Zstandard/UTF-8 válido, normalizado e não vazio",
             "E_exact": "R_valid deduplicado pelo SHA-256 do texto normalizado",
             "B_clean": "E_exact sem repetição intradomínio aprovada e deduplicado novamente",
+            "B_clean_v2": (
+                "B_clean com regras MediaWiki e repetição estrutural curta confirmadas; "
+                "deduplicado em D4"
+            ),
             "N_near": "sensibilidade opcional; não altera B_clean",
         },
         "normalization": [
@@ -97,17 +111,26 @@ def build_reports(
             "runtime": config.public_dict()["runtime"],
             "source": config.public_dict()["source"],
             "boilerplate": config.public_dict()["boilerplate"],
+            "boilerplate_v2": config.public_dict()["boilerplate_v2"],
             "lexical": config.public_dict()["lexical"],
             "content": config.public_dict()["content"],
             "near_duplicates": config.public_dict()["near_duplicates"],
             "sampling": config.public_dict()["sampling"],
         },
         "spacy": lexical["spacy"],
-        "content_spacy": content.get("spacy"),
+        "content_spacy": (content_v2 or content).get("spacy"),
         "content_config_sha256": config.content_fingerprint,
+        "presentation_filter": {
+            "kind": f"filtro visual explícito; não altera {main_view}",
+            "mediawiki_ruleset_version": MEDIAWIKI_RULESET_VERSION,
+        },
         "review_gate": review_gate,
         "invariants": invariants,
     }
+    if has_v2:
+        methods["primary_view"] = "B_clean_v2"
+        methods["review_confirmation_v2"] = clean_v2["confirmation"]
+        methods["invariants_v2"] = read_json(root / "v2" / "invariants.json", {})
     atomic_json(result / "methods.json", methods)
     summary = {
         "snapshot_id": manifest["snapshot_id"],
@@ -120,6 +143,16 @@ def build_reports(
         "review_gate": review_gate,
         "invariants": invariants,
     }
+    if has_v2:
+        summary.update(
+            {
+                "clean_v2": clean_v2,
+                "lexical_v2": lexical_v2,
+                "content_v2": content_v2,
+                "invariants_v2": methods["invariants_v2"],
+                "primary_view": "B_clean_v2",
+            }
+        )
     near_path = root / "near_summary.json"
     if near_path.exists():
         summary["near_duplicates"] = json.loads(near_path.read_text())
@@ -158,17 +191,21 @@ def build_reports(
         ["status", "total"],
         ((key, value) for key, value, _p, _d in status_rows),
     )
-    nonterminal = {"pending", "processing", "in_progress", "em processamento", "pendente"}
+    explored_statuses = {
+        "done",
+        "failed",
+        "failed_timeout",
+        "blocked_domain",
+        "blocked_language",
+    }
     terminal = [
-        (key, value)
-        for key, value in status.items()
-        if key.casefold() not in nonterminal and not key.startswith("<")
+        (key, value) for key, value in status.items() if key.casefold() in explored_statuses
     ]
     terminal_total = sum(value for _key, value in terminal)
     write_table(
         tables,
         "03_status_explorados",
-        ["status_terminal", "total", "percentual", "denominador"],
+        ["status_explorado", "total", "percentual", "denominador"],
         (
             (key, value, _percent(value, terminal_total), terminal_total)
             for key, value in sorted(terminal, key=lambda x: -x[1])
@@ -184,6 +221,13 @@ def build_reports(
         ("B_clean não vazio", clean["b_clean_nonempty"]),
         ("D3/B_clean único", clean["d3_unique"]),
     ]
+    if has_v2:
+        funnel.extend(
+            [
+                ("B_clean_v2 não vazio", clean_v2["b_clean_v2_nonempty"]),
+                ("D4/B_clean_v2 único", clean_v2["d4_unique"]),
+            ]
+        )
     write_table(tables, "04_funil", ["etapa", "documentos"], funnel)
     write_table(figures_data, "funil", ["etapa", "documentos"], funnel)
     view_rows = []
@@ -198,6 +242,17 @@ def build_reports(
                 *quantiles,
             )
         )
+    if has_v2:
+        for view, value in lexical_v2["views"].items():
+            view_rows.append(
+                (
+                    view,
+                    value["documents"],
+                    value["characters"],
+                    value["words"],
+                    *value["word_quantiles"],
+                )
+            )
     write_table(
         tables,
         "05_resumo_corpus",
@@ -229,14 +284,44 @@ def build_reports(
             ("caracteres cobertos por parágrafos", clean["paragraph_characters_covered"]),
             ("caracteres cobertos por blocos", clean["block_characters_covered"]),
             ("grupos duplicados D3", clean["d3_duplicate_groups"]),
-        ],
+        ]
+        + (
+            [
+                ("documentos afetados v2", clean_v2["documents_affected"]),
+                ("documentos esvaziados v2", clean_v2["documents_emptied"]),
+                ("caracteres removidos v2", clean_v2["removed_characters"]),
+                ("regras MediaWiki removidas", clean_v2["mediawiki_matches_removed"]),
+                ("linhas curtas removidas", clean_v2["short_line_matches_removed"]),
+                ("pares de linhas removidos", clean_v2["short_pair_matches_removed"]),
+                ("caracteres MediaWiki", clean_v2["mediawiki_characters_removed"]),
+                ("caracteres linhas curtas", clean_v2["short_line_characters_removed"]),
+                ("caracteres pares de linhas", clean_v2["short_pair_characters_removed"]),
+                ("grupos duplicados D4", clean_v2["d4_duplicate_groups"]),
+                (
+                    "documentos removidos por D4",
+                    clean_v2["b_clean_v2_nonempty"] - clean_v2["d4_unique"],
+                ),
+                (
+                    "text_md5 divergente de todas as representações",
+                    clean_v2["text_md5_diagnostic"].get("mismatch_all_representations", 0),
+                ),
+            ]
+            if has_v2
+            else []
+        ),
     )
 
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
     )
-    _domain_and_level_tables(connection, tables, figures_data, sampled=sampled)
-    _distribution_tables(connection, root, figures_data)
+    _domain_and_level_tables(
+        connection,
+        tables,
+        figures_data,
+        sampled=sampled,
+        v2_root=main_root if has_v2 else None,
+    )
+    _distribution_tables(connection, root, figures_data, v2_root=main_root if has_v2 else None)
     vocab_rows = [
         (
             key.split(":")[0],
@@ -250,6 +335,20 @@ def build_reports(
         )
         for key, value in lexical["vocabulary"].items()
     ]
+    if has_v2:
+        vocab_rows.extend(
+            (
+                key.split(":")[0],
+                key.split(":")[1],
+                value["types"],
+                value["hapax"],
+                value["occurrences"],
+                value["document_occurrences"],
+                value["stopword_types"],
+                value["stopword_occurrences"],
+            )
+            for key, value in lexical_v2["vocabulary"].items()
+        )
     write_table(
         tables,
         "11_vocabulario",
@@ -272,7 +371,7 @@ def build_reports(
         GROUP BY view, kind, total_frequency
         ORDER BY view, kind, total_frequency
         """,
-        [str(root / "vocabulary.parquet")],
+        [str(main_root / "vocabulary.parquet")],
     ).fetchall()
     write_table(
         tables,
@@ -280,24 +379,62 @@ def build_reports(
         ["visao", "tipo", "frequencia", "tipos"],
         frequency_of_frequencies,
     )
-    top_terms = connection.execute(
+    candidate_limit = max(1_000, config.lexical.published_items * 10)
+    term_candidates = connection.execute(
         """
         SELECT kind, term, total_frequency, document_frequency
         FROM read_parquet(?)
-        WHERE view='B_clean' AND NOT is_stop
+        WHERE view=? AND NOT is_stop
         QUALIFY row_number() OVER (PARTITION BY kind ORDER BY total_frequency DESC, term) <= ?
         ORDER BY kind, total_frequency DESC, term
         """,
-        [str(root / "vocabulary.parquet"), config.lexical.published_items],
+        [str(main_root / "vocabulary.parquet"), main_view, candidate_limit],
     ).fetchall()
-    top_bigrams = connection.execute(
+    top_terms = []
+    for kind in ("form", "lemma"):
+        top_terms.extend(row for row in term_candidates if row[0] == kind)
+    raw_top_terms = [
+        row
+        for kind in ("form", "lemma")
+        for row in [item for item in top_terms if item[0] == kind][: config.lexical.published_items]
+    ]
+    bigram_candidates = connection.execute(
         """
         SELECT replace(bigram, chr(9), ' ') AS bigram, total_frequency, document_frequency
         FROM read_parquet(?) WHERE NOT contains_stopword
         ORDER BY total_frequency DESC, bigram LIMIT ?
         """,
-        [str(root / "bigrams.parquet"), config.lexical.published_items],
+        [str(main_root / "bigrams.parquet"), candidate_limit],
     ).fetchall()
+    raw_top_bigrams = bigram_candidates[: config.lexical.published_items]
+    if has_v2:
+        top_terms = [
+            row
+            for kind in ("form", "lemma")
+            for row in [
+                item
+                for item in term_candidates
+                if item[0] == kind and not is_presentation_noise(item[1])
+            ][: config.lexical.published_items]
+        ]
+        top_bigrams = [row for row in bigram_candidates if not is_presentation_noise(row[0])][
+            : config.lexical.published_items
+        ]
+        write_table(
+            tables,
+            "12g_diagnostico_formas_lemas_v2_com_interface",
+            ["tipo", "item", "frequencia", "documentos"],
+            raw_top_terms,
+        )
+        write_table(
+            tables,
+            "12h_diagnostico_bigramas_v2_com_interface",
+            ["bigrama", "frequencia", "documentos"],
+            raw_top_bigrams,
+        )
+    else:
+        top_terms = raw_top_terms
+        top_bigrams = raw_top_bigrams
     write_table(
         tables,
         "12a_principais_formas_lemas",
@@ -306,6 +443,55 @@ def build_reports(
     )
     write_table(
         tables, "12b_principais_bigramas", ["bigrama", "frequencia", "documentos"], top_bigrams
+    )
+    if has_v2:
+        previous_terms = connection.execute(
+            "SELECT kind,term,total_frequency,document_frequency FROM read_parquet(?) "
+            "WHERE view='B_clean' AND NOT is_stop "
+            "QUALIFY row_number() OVER(PARTITION BY kind ORDER BY total_frequency DESC,term)<=? "
+            "ORDER BY kind,total_frequency DESC,term",
+            [str(root / "vocabulary.parquet"), config.lexical.published_items],
+        ).fetchall()
+        previous_bigrams = connection.execute(
+            "SELECT replace(bigram,chr(9),' '),total_frequency,document_frequency "
+            "FROM read_parquet(?) WHERE NOT contains_stopword "
+            "ORDER BY total_frequency DESC,bigram LIMIT ?",
+            [str(root / "bigrams.parquet"), config.lexical.published_items],
+        ).fetchall()
+        write_table(
+            tables,
+            "12e_principais_formas_lemas_b_clean_v1",
+            ["tipo", "item", "frequencia", "documentos"],
+            previous_terms,
+        )
+        write_table(
+            tables,
+            "12f_principais_bigramas_b_clean_v1",
+            ["bigrama", "frequencia", "documentos"],
+            previous_bigrams,
+        )
+    filtered_terms = [row for row in term_candidates if not is_presentation_noise(row[1])]
+    filtered_terms = [
+        row
+        for kind in ("form", "lemma")
+        for row in [item for item in filtered_terms if item[0] == kind][
+            : config.lexical.published_items
+        ]
+    ]
+    filtered_bigrams = [row for row in bigram_candidates if not is_presentation_noise(row[0])][
+        : config.lexical.published_items
+    ]
+    write_table(
+        tables,
+        "12c_principais_formas_lemas_sem_interface",
+        ["tipo", "item", "frequencia", "documentos", "filtro"],
+        ((*row, f"visual; não altera {main_view}") for row in filtered_terms),
+    )
+    write_table(
+        tables,
+        "12d_principais_bigramas_sem_interface",
+        ["bigrama", "frequencia", "documentos", "filtro"],
+        ((*row, f"visual; não altera {main_view}") for row in filtered_bigrams),
     )
     figure_terms = [row for row in top_terms if row[0] == "form"][: config.lexical.figure_items]
     write_table(
@@ -320,15 +506,33 @@ def build_reports(
         ["item", "frequencia"],
         (row[:2] for row in top_bigrams[: config.lexical.figure_items]),
     )
-    if content.get("status") == "complete":
+    filtered_figure_terms = [row for row in filtered_terms if row[0] == "form"][
+        : config.lexical.figure_items
+    ]
+    write_table(
+        figures_data,
+        "principais_termos_sem_interface",
+        ["tipo", "item", "frequencia"],
+        (row[:3] for row in filtered_figure_terms),
+    )
+    write_table(
+        figures_data,
+        "principais_bigramas_sem_interface",
+        ["item", "frequencia"],
+        (row[:2] for row in filtered_bigrams[: config.lexical.figure_items]),
+    )
+    main_content = content_v2 if has_v2 else content
+    if main_content.get("status") == "complete":
         _content_tables(
             connection,
             config,
-            content,
-            root,
+            main_content,
+            main_root,
             tables,
             figures_data,
             sampled=sampled,
+            view=main_view,
+            comparison=(content, root, "B_clean") if has_v2 else None,
         )
     connection.close()
     return result
@@ -361,13 +565,15 @@ def _metric_quantiles(connection, expression: str, *, where: str = "true") -> tu
         f"""
         SELECT count({expression}), avg({expression}),
                quantile_cont({expression}, [0.05,0.25,0.5,0.75,0.95,0.99])
-        FROM content_document_statistics WHERE {where}
+        FROM report_content_document_statistics WHERE {where}
         """
     ).fetchone()
 
 
-def _vocabulary_curves(connection, config: Config, root: Path) -> list[tuple]:
-    documents = connection.execute("SELECT count(*) FROM content_document_statistics").fetchone()[0]
+def _vocabulary_curves(connection, config: Config, root: Path, *, view: str) -> list[tuple]:
+    documents = connection.execute(
+        "SELECT count(*) FROM report_content_document_statistics"
+    ).fetchone()[0]
     if not documents:
         return []
     checkpoints: set[int] = {documents} if documents else set()
@@ -388,7 +594,7 @@ def _vocabulary_curves(connection, config: Config, root: Path) -> list[tuple]:
         """
         WITH ranked_documents AS (
           SELECT priority, row_number() OVER(ORDER BY priority, row_number) document_rank
-          FROM content_document_statistics
+          FROM report_content_document_statistics
         ), first_ranks AS (
           SELECT v.kind, d.document_rank, count(*) new_types
           FROM read_parquet(?) v JOIN ranked_documents d ON v.first_priority=d.priority
@@ -451,9 +657,9 @@ def _vocabulary_curves(connection, config: Config, root: Path) -> list[tuple]:
         frequencies = connection.execute(
             """
             SELECT total_frequency FROM read_parquet(?)
-            WHERE view='B_clean' AND kind=? ORDER BY total_frequency DESC, term
+            WHERE view=? AND kind=? ORDER BY total_frequency DESC, term
             """,
-            [str(root / "vocabulary.parquet"), kind],
+            [str(root / "vocabulary.parquet"), view, kind],
         ).fetchall()
         total = sum(row[0] for row in frequencies)
         running = 0
@@ -483,7 +689,14 @@ def _content_tables(
     aggregates: Path,
     *,
     sampled: bool,
+    view: str,
+    comparison: tuple[dict, Path, str] | None = None,
 ) -> None:
+    documents_glob = str(root / "content" / "documents" / "*.parquet").replace("'", "''")
+    connection.execute(
+        f"CREATE OR REPLACE TEMP VIEW report_content_document_statistics AS "
+        f"SELECT * FROM read_parquet('{documents_glob}')"
+    )
     histogram_summary = _weighted_histogram_summary(connection, root)
     write_table(
         tables,
@@ -516,7 +729,7 @@ def _content_tables(
         SELECT CASE WHEN words<100 THEN '0-99' WHEN words<500 THEN '100-499'
                     WHEN words<2000 THEN '500-1999' ELSE '2000+' END faixa_palavras,
                count(*), avg(ttr), quantile_cont(ttr,0.5)
-        FROM content_document_statistics GROUP BY 1
+        FROM report_content_document_statistics GROUP BY 1
         ORDER BY min(words)
         """
     ).fetchall()
@@ -536,9 +749,9 @@ def _content_tables(
         """
         SELECT metric, metric_value, count(*) documents FROM (
           SELECT 'TTR' metric, round(ttr,4) AS metric_value
-          FROM content_document_statistics WHERE words>0
+          FROM report_content_document_statistics WHERE words>0
           UNION ALL
-          SELECT 'MATTR', round(mattr,4) FROM content_document_statistics WHERE mattr IS NOT NULL
+          SELECT 'MATTR', round(mattr,4) FROM report_content_document_statistics WHERE mattr IS NOT NULL
         ) GROUP BY metric, metric_value ORDER BY metric, metric_value
         """
     ).fetchall()
@@ -581,7 +794,7 @@ def _content_tables(
     ):
         count, mean, quantiles = _metric_quantiles(connection, expression)
         affected = connection.execute(
-            f"SELECT count(*) FROM content_document_statistics WHERE {expression}>?",
+            f"SELECT count(*) FROM report_content_document_statistics WHERE {expression}>?",
             [affected_threshold],
         ).fetchone()[0]
         repetition_rows.append((label, count, affected, mean, *(quantiles or [None] * 6)))
@@ -602,14 +815,23 @@ def _content_tables(
         ],
         repetition_rows,
     )
+    if comparison:
+        _comparison_content_tables(
+            connection,
+            comparison,
+            view,
+            repetition_rows,
+            signal_columns=None,
+            tables=tables,
+        )
     repetition_distribution = connection.execute(
         """
         SELECT metric, metric_value, count(*) documents FROM (
           SELECT 'frases' metric, round(repeated_sentence_fraction,4) AS metric_value
-          FROM content_document_statistics
+          FROM report_content_document_statistics
           UNION ALL
           SELECT 'paragrafos', round(repeated_paragraph_fraction,4)
-          FROM content_document_statistics
+          FROM report_content_document_statistics
         ) GROUP BY metric, metric_value ORDER BY metric, metric_value
         """
     ).fetchall()
@@ -636,7 +858,8 @@ def _content_tables(
     signal_rows = []
     for label, expression in signal_columns:
         occurrences, affected = connection.execute(
-            f"SELECT sum({expression}), count(*) FILTER (WHERE {expression}>0) FROM content_document_statistics"
+            f"SELECT sum({expression}), count(*) FILTER (WHERE {expression}>0) "
+            "FROM report_content_document_statistics"
         ).fetchone()
         signal_rows.append(
             (label, occurrences or 0, affected, affected / documents if documents else 0, documents)
@@ -647,6 +870,16 @@ def _content_tables(
         ["indicador", "ocorrencias", "documentos", "participacao_documentos", "denominador"],
         signal_rows,
     )
+    if comparison:
+        _comparison_content_tables(
+            connection,
+            comparison,
+            view,
+            repetition_rows,
+            signal_columns=signal_columns,
+            tables=tables,
+            main_signal_rows=signal_rows,
+        )
     write_table(
         aggregates,
         "sinais_textuais",
@@ -683,9 +916,12 @@ def _content_tables(
             str(root / "content_bigram_marginals.parquet"),
             bigram_floor,
             config.content.collocation_min_documents,
-            config.lexical.published_items,
+            max(1_000, config.lexical.published_items * 10),
         ],
     ).fetchall()
+    if view == "B_clean_v2":
+        bigram_rows = [row for row in bigram_rows if not is_presentation_noise(row[0])]
+    bigram_rows = bigram_rows[: config.lexical.published_items]
     trigram_floor = content["trigrams"]["eligible_frequency_floor"]
     trigram_rows = connection.execute(
         """
@@ -698,12 +934,15 @@ def _content_tables(
             str(root / "content_trigrams.parquet"),
             trigram_floor,
             config.content.collocation_min_documents,
-            config.lexical.published_items,
+            max(1_000, config.lexical.published_items * 10),
         ],
     ).fetchall()
-    collocation_rows = [
-        ("bigrama_NPMI", *row) for row in bigram_rows
-    ] + [("trigrama_frequente", *row, None, None) for row in trigram_rows]
+    if view == "B_clean_v2":
+        trigram_rows = [row for row in trigram_rows if not is_presentation_noise(row[0])]
+    trigram_rows = trigram_rows[: config.lexical.published_items]
+    collocation_rows = [("bigrama_NPMI", *row) for row in bigram_rows] + [
+        ("trigrama_frequente", *row, None, None) for row in trigram_rows
+    ]
     write_table(
         tables,
         "19_colocacoes",
@@ -736,7 +975,7 @@ def _content_tables(
                quantile_cont(c.lexical_density,0.5) median_lexical_density,
                avg(c.repeated_paragraph_fraction) mean_paragraph_repetition,
                avg(c.any_signal::INTEGER) signal_prevalence
-        FROM content_document_statistics c JOIN canonical_domains d ON c.domain_id=d.id
+        FROM report_content_document_statistics c JOIN canonical_domains d ON c.domain_id=d.id
         GROUP BY d.id, d.host HAVING count(*)>=?
         ORDER BY words DESC, d.host LIMIT ?
         """,
@@ -767,7 +1006,7 @@ def _content_tables(
         (row[:-1] for row in domain_rows[:20]),
     )
 
-    vocabulary_curve = _vocabulary_curves(connection, config, root)
+    vocabulary_curve = _vocabulary_curves(connection, config, root, view=view)
     write_table(
         tables,
         "21_cobertura_vocabulario",
@@ -782,7 +1021,101 @@ def _content_tables(
     )
 
 
-def _domain_and_level_tables(connection, tables: Path, aggregates: Path, *, sampled: bool) -> None:
+def _comparison_content_tables(
+    connection,
+    comparison: tuple[dict, Path, str],
+    main_view: str,
+    main_repetition_rows: list[tuple],
+    *,
+    signal_columns,
+    tables: Path,
+    main_signal_rows: list[tuple] | None = None,
+) -> None:
+    previous_content, previous_root, previous_view = comparison
+    documents_glob = str(previous_root / "content" / "documents" / "*.parquet").replace("'", "''")
+    connection.execute(
+        f"CREATE OR REPLACE TEMP VIEW comparison_content_document_statistics AS "
+        f"SELECT * FROM read_parquet('{documents_glob}')"
+    )
+    if signal_columns is None:
+        rows = []
+        definitions = (
+            ("fracao_palavras_frases_repetidas", "repeated_sentence_fraction", 0),
+            ("fracao_palavras_paragrafos_repetidos", "repeated_paragraph_fraction", 0),
+            ("maior_sequencia_frases_identicas", "max_sentence_run", 1),
+            ("maior_sequencia_paragrafos_identicos", "max_paragraph_run", 1),
+        )
+        for label, expression, threshold in definitions:
+            count, mean, quantiles = connection.execute(
+                f"SELECT count({expression}),avg({expression}),"
+                f"quantile_cont({expression},[0.05,0.25,0.5,0.75,0.95,0.99]) "
+                "FROM comparison_content_document_statistics"
+            ).fetchone()
+            affected = connection.execute(
+                f"SELECT count(*) FROM comparison_content_document_statistics WHERE {expression}>?",
+                [threshold],
+            ).fetchone()[0]
+            rows.append((label, count, affected, mean, *(quantiles or [None] * 6)))
+        write_table(
+            tables,
+            "17b_repeticao_b_clean_vs_v2",
+            [
+                "visao",
+                "metrica",
+                "documentos",
+                "documentos_afetados",
+                "media",
+                "p5",
+                "p25",
+                "p50",
+                "p75",
+                "p95",
+                "p99",
+            ],
+            [(previous_view, *row) for row in rows]
+            + [(main_view, *row) for row in main_repetition_rows],
+        )
+        return
+    previous_documents = previous_content["metrics"]["documents"]
+    previous_signals = []
+    for label, expression in signal_columns:
+        occurrences, affected = connection.execute(
+            f"SELECT sum({expression}),count(*) FILTER (WHERE {expression}>0) "
+            "FROM comparison_content_document_statistics"
+        ).fetchone()
+        previous_signals.append(
+            (
+                label,
+                occurrences or 0,
+                affected,
+                affected / previous_documents if previous_documents else 0,
+                previous_documents,
+            )
+        )
+    write_table(
+        tables,
+        "18b_sinais_b_clean_vs_v2",
+        [
+            "visao",
+            "indicador",
+            "ocorrencias",
+            "documentos",
+            "participacao_documentos",
+            "denominador",
+        ],
+        [(previous_view, *row) for row in previous_signals]
+        + [(main_view, *row) for row in (main_signal_rows or [])],
+    )
+
+
+def _domain_and_level_tables(
+    connection,
+    tables: Path,
+    aggregates: Path,
+    *,
+    sampled: bool,
+    v2_root: Path | None = None,
+) -> None:
     connection.execute(
         """
         CREATE OR REPLACE TEMP VIEW canonical_domains AS
@@ -791,18 +1124,33 @@ def _domain_and_level_tables(connection, tables: Path, aggregates: Path, *, samp
         ) WHERE rn=1
         """
     )
+    if v2_root:
+        document_glob = str(v2_root / "lexical" / "documents" / "*.parquet").replace("'", "''")
+        connection.execute(
+            f"CREATE OR REPLACE TEMP VIEW report_document_statistics AS "
+            f"SELECT * FROM read_parquet('{document_glob}')"
+        )
+        unique_source = "d4_membership"
+        word_view = "B_clean_v2"
+    else:
+        connection.execute(
+            "CREATE OR REPLACE TEMP VIEW report_document_statistics AS "
+            "SELECT * FROM document_statistics"
+        )
+        unique_source = "d2_membership"
+        word_view = "B_clean"
     levels = connection.execute(
-        """
+        f"""
         WITH d AS (SELECT recursion_level AS depth, count(*) domains, sum(request_count) requests
                    FROM canonical_domains GROUP BY 1),
         p AS (SELECT recursion_level AS depth, count(*) pages,
                      count(*) FILTER (WHERE status='done') done
               FROM page_inventory GROUP BY 1),
         v AS (SELECT recursion_level AS depth, count(*) valid_documents FROM page_features GROUP BY 1),
-        u AS (SELECT recursion_level AS depth, count(*) unique_documents FROM d2_membership
+        u AS (SELECT recursion_level AS depth, count(*) unique_documents FROM {unique_source}
               WHERE is_representative GROUP BY 1),
-        w AS (SELECT recursion_level AS depth, sum(words) words FROM document_statistics
-              WHERE view='B_clean' GROUP BY 1)
+        w AS (SELECT recursion_level AS depth, sum(words) words FROM report_document_statistics
+              WHERE view='{word_view}' GROUP BY 1)
         SELECT coalesce(d.depth,p.depth,v.depth,u.depth,w.depth) AS depth,
                coalesce(domains,0), coalesce(requests,0), coalesce(pages,0), coalesce(done,0),
                coalesce(valid_documents,0), coalesce(unique_documents,0), coalesce(words,0),
@@ -831,46 +1179,91 @@ def _domain_and_level_tables(connection, tables: Path, aggregates: Path, *, samp
         ["nivel", "palavras_por_mil_requisicoes", "aplicavel"],
         ((row[0], "" if sampled else row[-1] or 0, not sampled) for row in levels),
     )
+    if v2_root:
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_content AS
+            SELECT cv.clean_v2_sha256 content_hash, ds.words
+            FROM clean_v2_features cv JOIN d4_membership d4 USING(row_number)
+            JOIN report_document_statistics ds USING(row_number)
+            WHERE d4.is_representative AND ds.view='B_clean_v2'
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_memberships AS
+            SELECT DISTINCT cv.clean_v2_sha256 content_hash, page.domain_id
+            FROM clean_v2_features cv
+            JOIN d3_membership source ON source.row_number=cv.row_number
+            JOIN d3_membership member ON member.clean_sha256=source.clean_sha256
+            JOIN d2_membership page ON page.normalized_sha256=member.normalized_sha256
+            WHERE page.domain_id IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_page AS
+            SELECT page.domain_id, sum(content.words) clean_words_page_weighted
+            FROM clean_v2_features cv
+            JOIN d3_membership source ON source.row_number=cv.row_number
+            JOIN d3_membership member ON member.clean_sha256=source.clean_sha256
+            JOIN d2_membership page ON page.normalized_sha256=member.normalized_sha256
+            JOIN report_clean_content content
+              ON content.content_hash=cv.clean_v2_sha256
+            GROUP BY page.domain_id
+            """
+        )
+    else:
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_content AS
+            SELECT dm.clean_sha256 content_hash, ds.words
+            FROM d3_membership dm JOIN report_document_statistics ds USING(row_number)
+            WHERE dm.is_representative AND ds.view='B_clean'
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_memberships AS
+            SELECT DISTINCT dm.clean_sha256 content_hash, e.domain_id
+            FROM d3_membership dm JOIN d2_membership e USING(normalized_sha256)
+            WHERE e.domain_id IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW report_clean_page AS
+            SELECT e.domain_id, sum(c.words) clean_words_page_weighted
+            FROM d2_membership e
+            JOIN (SELECT DISTINCT normalized_sha256,clean_sha256 FROM d3_membership) m
+              USING(normalized_sha256)
+            JOIN report_clean_content c ON c.content_hash=m.clean_sha256
+            GROUP BY e.domain_id
+            """
+        )
     connection.execute(
         """
         CREATE OR REPLACE TEMP VIEW clean_domain_fractional AS
-        WITH content AS (
-          SELECT dm.clean_sha256, ds.words
-          FROM d3_membership dm JOIN document_statistics ds USING(row_number)
-          WHERE dm.is_representative AND ds.view='B_clean'
-        ), memberships AS (
-          SELECT DISTINCT dm.clean_sha256, e.domain_id
-          FROM d3_membership dm JOIN d2_membership e USING(normalized_sha256)
-          WHERE e.domain_id IS NOT NULL
-        ), weights AS (
-          SELECT *, count(*) OVER(PARTITION BY clean_sha256) domains FROM memberships
+        WITH weights AS (
+          SELECT *, count(*) OVER(PARTITION BY content_hash) domains
+          FROM report_clean_memberships
         )
         SELECT domain_id, sum(c.words / w.domains) words
-        FROM content c JOIN weights w USING(clean_sha256) GROUP BY domain_id
+        FROM report_clean_content c JOIN weights w USING(content_hash) GROUP BY domain_id
         """
     )
     connection.execute(
         """
         CREATE OR REPLACE TEMP VIEW domain_metrics AS
         WITH valid_pages AS (SELECT domain_id, count(*) valid_documents FROM page_features GROUP BY 1),
-        clean_content AS (
-          SELECT dm.clean_sha256, ds.words
-          FROM d3_membership dm JOIN document_statistics ds USING(row_number)
-          WHERE dm.is_representative AND ds.view='B_clean'
-        ), clean_map AS (
-          SELECT DISTINCT normalized_sha256, clean_sha256 FROM d3_membership
-        ), clean_page AS (
-          SELECT e.domain_id, sum(c.words) clean_words_page_weighted
-          FROM d2_membership e JOIN clean_map m USING(normalized_sha256)
-          JOIN clean_content c USING(clean_sha256) GROUP BY e.domain_id
-        ),
         base AS (
           SELECT d.id, d.host, d.is_wikimedia, d.request_count,
                  coalesce(v.valid_documents,0) valid_documents,
                  coalesce(c.clean_words_page_weighted,0) clean_page,
                  coalesce(f.words,0) clean_fractional
           FROM canonical_domains d LEFT JOIN valid_pages v ON d.id=v.domain_id
-          LEFT JOIN clean_page c ON d.id=c.domain_id LEFT JOIN clean_domain_fractional f ON d.id=f.domain_id
+          LEFT JOIN report_clean_page c ON d.id=c.domain_id
+          LEFT JOIN clean_domain_fractional f ON d.id=f.domain_id
         )
         SELECT * FROM base
         """
@@ -970,13 +1363,23 @@ def _domain_and_level_tables(connection, tables: Path, aggregates: Path, *, samp
     write_table(aggregates, "lorenz", ["fracao_dominios", "fracao_palavras"], lorenz)
 
 
-def _distribution_tables(connection, root: Path, aggregates: Path) -> None:
+def _distribution_tables(
+    connection, root: Path, aggregates: Path, *, v2_root: Path | None = None
+) -> None:
     lengths = connection.execute(
         """
         SELECT view, words, count(*) documents FROM document_statistics
         WHERE view IN ('R_valid','B_clean') GROUP BY view, words ORDER BY view, words
         """
     ).fetchall()
+    if v2_root:
+        lengths.extend(
+            connection.execute(
+                "SELECT view,words,count(*) FROM read_parquet(?) "
+                "GROUP BY view,words ORDER BY view,words",
+                [str(v2_root / "lexical" / "documents" / "*.parquet")],
+            ).fetchall()
+        )
     write_table(aggregates, "tamanho_documentos", ["visao", "palavras", "documentos"], lengths)
     removal = connection.execute(
         """
@@ -985,6 +1388,17 @@ def _distribution_tables(connection, root: Path, aggregates: Path) -> None:
         """
     ).fetchall()
     write_table(aggregates, "fracao_removida", ["fracao", "documentos"], removal)
+    if v2_root:
+        removal_v2 = connection.execute(
+            "SELECT round(removed_fraction,4),count(*) FROM read_parquet(?) GROUP BY 1 ORDER BY 1",
+            [str(v2_root / "clean" / "chunks" / "*.parquet")],
+        ).fetchall()
+        write_table(
+            aggregates,
+            "fracao_removida_v2",
+            ["fracao", "documentos"],
+            removal_v2,
+        )
     clusters = connection.execute(
         """
         SELECT 'D2' AS stage, pages AS group_size, count(*) AS group_count
@@ -995,18 +1409,29 @@ def _distribution_tables(connection, root: Path, aggregates: Path) -> None:
         """,
         [str(root / "d2_groups.parquet"), str(root / "d3_groups.parquet")],
     ).fetchall()
+    if v2_root:
+        clusters.extend(
+            connection.execute(
+                "SELECT 'D4',documents,count(*) FROM read_parquet(?) "
+                "GROUP BY documents ORDER BY documents",
+                [str(v2_root / "d4_groups.parquet")],
+            ).fetchall()
+        )
     write_table(aggregates, "tamanho_grupos", ["etapa", "tamanho", "grupos"], clusters)
     zipf = connection.execute(
         """
         WITH ranked AS (
           SELECT kind, total_frequency,
                  row_number() OVER(PARTITION BY kind ORDER BY total_frequency DESC, term) rank
-          FROM read_parquet(?) WHERE view='B_clean'
+          FROM read_parquet(?) WHERE view=?
         )
         SELECT kind, avg(rank) rank, avg(total_frequency) frequency
         FROM ranked GROUP BY kind, floor(100*log10(rank)) ORDER BY kind, rank
         """,
-        [str(root / "vocabulary.parquet")],
+        [
+            str((v2_root or root) / "vocabulary.parquet"),
+            "B_clean_v2" if v2_root else "B_clean",
+        ],
     ).fetchall()
     write_table(aggregates, "zipf", ["tipo", "rank", "frequencia"], zipf)
 
@@ -1017,3 +1442,29 @@ def write_checksums(result: Path) -> None:
     ]
     lines = [f"{sha256_file(path)}  {path.relative_to(result)}" for path in sorted(paths)]
     (result / "checksums.sha256").write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def archive_method_v1(result: Path) -> Path | None:
+    """Preserve the current small public result before rewriting its reports."""
+    if not (result / "summary.json").exists():
+        return None
+    current = read_json(result / "summary.json", {})
+    if current.get("primary_view") == "B_clean_v2":
+        return None
+    destination = result / "revisions" / "method-v1"
+    if destination.exists():
+        return destination
+    temporary = result.parent / f".{result.name}.method-v1.partial"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    for name in ("aggregates", "figures", "tables"):
+        source = result / name
+        if source.exists():
+            shutil.copytree(source, temporary / name)
+    for source in result.iterdir():
+        if source.is_file():
+            shutil.copy2(source, temporary / source.name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(temporary, destination)
+    return destination

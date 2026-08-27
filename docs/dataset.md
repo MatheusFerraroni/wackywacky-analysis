@@ -19,7 +19,7 @@ Campos analíticos: `id`, `domain_id`, `parent_page_id`, `same_as`, `status_code
 
 ## `domain.tsv`
 
-Campos analíticos: `id`, `url`, `parent_domain_id`, `recursion_level`, `status`, `request_count` e datas. O parser lê bytes e ignora `url_md5`, que pode conter dados binários. Da URL são derivados somente host e domínio registrável usando uma Public Suffix List offline.
+As nove colunas reais são `id`, `url`, `url_md5`, `parent_domain_id`, `recursion_level`, `request_count`, `last_request_at`, `created_at` e `updated_at`. Não há campo `status`. O parser lê bytes e ignora `url_md5`, que pode conter dados binários. Da URL são derivados somente host e domínio registrável usando uma Public Suffix List offline.
 
 IDs duplicados, pais ausentes, profundidade, requisições, hosts e agrupamento Wikimedia são medidos. `pages.domain_id` é validado contra `domain.id`.
 

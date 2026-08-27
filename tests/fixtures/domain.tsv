@@ -1,2 +1,2 @@
-id	url	url_md5	parent_domain_id	recursion_level	status	request_count	created_at	last_request_at
-1	https://fixture.invalid	binary-md5-placeholder	NULL	0	active	2	2026-08-20	2026-08-20
+id	url	url_md5	parent_domain_id	recursion_level	request_count	last_request_at	created_at	updated_at
+1	https://fixture.invalid	binary-md5-placeholder	NULL	0	2	2026-08-20	2026-08-20	2026-08-20

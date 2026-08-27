@@ -37,6 +37,7 @@ class ParsedDocument:
     raw: Any
     annotated: tuple[Any, ...]
 
+
 DOCUMENT_SCHEMA = pa.schema(
     [
         ("row_number", pa.uint64()),
@@ -103,6 +104,7 @@ LEXICAL_BATCH_BYTES = 8 * 1024 * 1024
 _WORKER_CONFIG: Config | None = None
 _WORKER_NLP = None
 _RECOUNT_WANTED: set[str] | None = None
+_RECOUNT_TRIGRAM_WANTED: set[str] | None = None
 
 
 class SpaceSaving:
@@ -138,9 +140,7 @@ class SpaceSaving:
                 return
 
     @classmethod
-    def restore(
-        cls, capacity: int, rows: list[tuple[str, int, int, int]]
-    ) -> SpaceSaving:
+    def restore(cls, capacity: int, rows: list[tuple[str, int, int, int]]) -> SpaceSaving:
         instance = cls(capacity)
         for key, count, error, version in rows:
             instance.values[key] = (count, error, version)
@@ -266,9 +266,7 @@ def _parse_document(nlp, text: str) -> ParsedDocument:
             start += SPACY_MAX_TOKENS_PER_CHUNK
     if start < len(raw):
         spans.append(raw[start:])
-    disabled = [
-        name for name in ("sentencizer", "senter", "parser") if name in nlp.pipe_names
-    ]
+    disabled = [name for name in ("sentencizer", "senter", "parser") if name in nlp.pipe_names]
     annotated = tuple(
         nlp.pipe(
             (span.as_doc(copy_user_data=False) for span in spans),
@@ -359,7 +357,7 @@ def _process_lexical_batch_with(
         for text, views in variants:
             document = _parse_document(nlp, text)
             forms, lemmas, numbers, other, _words = _token_data(document)
-            is_bclean = "B_clean" in views
+            is_bclean = any(view in {"B_clean", "B_clean_v2"} for view in views)
             content = None
             bigrams: list[str] = []
             if is_bclean:
@@ -438,13 +436,78 @@ def _recount_worker_batch(batch: list[str]) -> dict[str, Counter]:
     return _process_recount_batch_with(_WORKER_NLP, _RECOUNT_WANTED, batch)
 
 
+def _combined_recount_worker_init(config: Config, bigrams: set[str], trigrams: set[str]) -> None:
+    global _WORKER_CONFIG, _WORKER_NLP, _RECOUNT_WANTED, _RECOUNT_TRIGRAM_WANTED
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _WORKER_CONFIG = config
+    _WORKER_NLP = _load_nlp(config)
+    for pipe_name in list(_WORKER_NLP.pipe_names):
+        _WORKER_NLP.remove_pipe(pipe_name)
+    _RECOUNT_WANTED = bigrams
+    _RECOUNT_TRIGRAM_WANTED = trigrams
+
+
+def _process_combined_recount_batch_with(
+    nlp, bigrams: set[str], trigrams: set[str], batch: list[str]
+) -> dict[str, Counter]:
+    bigram_counts: Counter[str] = Counter()
+    bigram_documents: Counter[str] = Counter()
+    trigram_counts: Counter[str] = Counter()
+    trigram_documents: Counter[str] = Counter()
+    left_counts: Counter[str] = Counter()
+    right_counts: Counter[str] = Counter()
+    for clean in batch:
+        document = nlp.make_doc(clean)
+        seen_bigrams: set[str] = set()
+        seen_trigrams: set[str] = set()
+        for words in _paragraph_word_sequences(document, clean):
+            for left, right in pairwise(words):
+                left_counts[left] += 1
+                right_counts[right] += 1
+                key = left + "\t" + right
+                if key in bigrams:
+                    bigram_counts[key] += 1
+                    seen_bigrams.add(key)
+            for left, middle, right in zip(words, words[1:], words[2:], strict=False):
+                key = f"{left}\t{middle}\t{right}"
+                if key in trigrams:
+                    trigram_counts[key] += 1
+                    seen_trigrams.add(key)
+        bigram_documents.update(seen_bigrams)
+        trigram_documents.update(seen_trigrams)
+    return {
+        "bigram_counts": bigram_counts,
+        "bigram_documents": bigram_documents,
+        "trigram_counts": trigram_counts,
+        "trigram_documents": trigram_documents,
+        "left_counts": left_counts,
+        "right_counts": right_counts,
+    }
+
+
+def _combined_recount_worker_batch(batch: list[str]) -> dict[str, Counter]:
+    if _WORKER_NLP is None or _RECOUNT_WANTED is None or _RECOUNT_TRIGRAM_WANTED is None:
+        raise RuntimeError("worker de recontagem combinada não inicializado")
+    return _process_combined_recount_batch_with(
+        _WORKER_NLP, _RECOUNT_WANTED, _RECOUNT_TRIGRAM_WANTED, batch
+    )
+
+
 class _OrderedBatchPool:
     """Bound input bytes and merge completed worker batches in submission order."""
 
-    def __init__(self, config: Config, *, mode: str, wanted: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        mode: str,
+        wanted: set[str] | None = None,
+        trigram_wanted: set[str] | None = None,
+    ) -> None:
         self.config = config
         self.mode = mode
         self.wanted = wanted
+        self.trigram_wanted = trigram_wanted
         self.workers = config.runtime.workers
         self.maximum_pending = max(1, 2 * self.workers)
         self.maximum_bytes = max(1, config.runtime.queue_bytes)
@@ -459,9 +522,12 @@ class _OrderedBatchPool:
             if mode == "lexical":
                 initializer = _lexical_worker_init
                 initargs = (config,)
-            else:
+            elif mode == "recount":
                 initializer = _recount_worker_init
                 initargs = (config, wanted or set())
+            else:
+                initializer = _combined_recount_worker_init
+                initargs = (config, wanted or set(), trigram_wanted or set())
             self.executor = ProcessPoolExecutor(
                 max_workers=self.workers,
                 mp_context=context,
@@ -472,7 +538,14 @@ class _OrderedBatchPool:
     def _run_inline(self, batch):
         if self.mode == "lexical":
             return _process_lexical_batch_with(self.config, self.inline_nlp, batch)
-        return _process_recount_batch_with(self.inline_nlp, self.wanted or set(), batch)
+        if self.mode == "recount":
+            return _process_recount_batch_with(self.inline_nlp, self.wanted or set(), batch)
+        return _process_combined_recount_batch_with(
+            self.inline_nlp,
+            self.wanted or set(),
+            self.trigram_wanted or set(),
+            batch,
+        )
 
     def _oldest(self):
         future, size = self.pending.popleft()
@@ -492,7 +565,12 @@ class _OrderedBatchPool:
         if self.executor is None:
             completed.append(self._run_inline(batch))
             return completed
-        target = _lexical_worker_batch if self.mode == "lexical" else _recount_worker_batch
+        if self.mode == "lexical":
+            target = _lexical_worker_batch
+        elif self.mode == "recount":
+            target = _recount_worker_batch
+        else:
+            target = _combined_recount_worker_batch
         future = self.executor.submit(target, batch)
         self.pending.append((future, size))
         self.pending_bytes += size
@@ -744,16 +822,12 @@ def _scan_lexical(
         flush_documents()
         if scan_complete and document_index == 0:
             path = document_dir / "documents-000000.parquet"
-            artifacts[str(path.relative_to(root))] = write_parquet_atomic(
-                path, [], DOCUMENT_SCHEMA
-            )
+            artifacts[str(path.relative_to(root))] = write_parquet_atomic(path, [], DOCUMENT_SCHEMA)
             document_index = 1
         vocabulary.flush()
         if scan_complete and vocabulary.index == 0:
             path = spill_dir / "spill-000000.parquet"
-            artifacts[str(path.relative_to(root))] = write_parquet_atomic(
-                path, [], SPILL_SCHEMA
-            )
+            artifacts[str(path.relative_to(root))] = write_parquet_atomic(path, [], SPILL_SCHEMA)
             vocabulary.index = 1
         checkpoint += 1
         content_state = content_writer.checkpoint(
@@ -1044,7 +1118,9 @@ def recount_bigrams(
         and state.get("candidate_checksum") == candidate_checksum
         and state.get("source_sha256") == manifest["sources"]["pages"]["sha256"]
     )
-    if state and (not compatible or not _checkpoint_artifacts_valid(root, state.get("artifacts", {}))):
+    if state and (
+        not compatible or not _checkpoint_artifacts_valid(root, state.get("artifacts", {}))
+    ):
         LOGGER.info("Recontagem: descartando estado incompatível ou checksum inválido")
         shutil.rmtree(recount_root, ignore_errors=True)
         state = {}
@@ -1060,9 +1136,7 @@ def recount_bigrams(
     for partial in recount_root.glob("*.partial"):
         partial.unlink(missing_ok=True)
     if state.get("complete"):
-        LOGGER.info(
-            "Recontagem: reutilizando %s checkpoints confirmados", f"{checkpoint:,}"
-        )
+        LOGGER.info("Recontagem: reutilizando %s checkpoints confirmados", f"{checkpoint:,}")
     else:
         if state:
             LOGGER.info(
@@ -1148,9 +1222,7 @@ def recount_bigrams(
         previous_term = signal.signal(signal.SIGTERM, request_stop)
         try:
             with _OrderedBatchPool(config, mode="recount", wanted=wanted) as pool:
-                for item in iter_bclean(
-                    config, root, start_offset=next_offset, start_row=next_row
-                ):
+                for item in iter_bclean(config, root, start_offset=next_offset, start_row=next_row):
                     if stop_requested:
                         break
                     next_offset = item.source.end_offset
@@ -1212,9 +1284,7 @@ def recount_bigrams(
             "bigram": term,
             "total_frequency": frequency,
             "document_frequency": document_frequency,
-            "contains_stopword": any(
-                component in stop_words for component in term.split("\t")
-            ),
+            "contains_stopword": any(component in stop_words for component in term.split("\t")),
         }
         for term, frequency, document_frequency in rows
     ]

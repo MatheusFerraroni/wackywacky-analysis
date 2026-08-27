@@ -12,6 +12,8 @@ from .io import decode_field, is_null, iter_bounded_tsv, parse_int
 from .schema import DOMAIN_COLUMNS, WIKIMEDIA_HOSTS
 from .storage import duckdb_connection, write_parquet_atomic
 
+DOMAIN_INVENTORY_VERSION = 2
+
 DOMAIN_SCHEMA = pa.schema(
     [
         ("row_number", pa.uint64()),
@@ -19,7 +21,6 @@ DOMAIN_SCHEMA = pa.schema(
         ("parent_domain_id", pa.int64()),
         ("recursion_level", pa.int32()),
         ("request_count", pa.int64()),
-        ("status", pa.string()),
         ("host", pa.string()),
         ("registrable_domain", pa.string()),
         ("is_wikimedia", pa.bool_()),
@@ -41,11 +42,20 @@ def _is_wikimedia(host: str | None) -> bool:
 
 
 def inventory_domains(config: Config, manifest: dict, root: Path) -> dict:
-    output = root / "domains.parquet"
-    if output.exists():
-        from .io import read_json
+    from .io import read_json
 
-        return read_json(root / "domain_summary.json", {})
+    output = root / "domains-v2.parquet"
+    summary_path = root / "domain_summary-v2.json"
+    summary = read_json(summary_path, {})
+    source_sha256 = manifest["sources"]["domains"]["sha256"]
+    if (
+        output.exists()
+        and summary.get("schema_version") == DOMAIN_INVENTORY_VERSION
+        and summary.get("source_sha256") == source_sha256
+    ):
+        connection = _install_domain_table(config, root, output)
+        connection.close()
+        return summary
     extractor = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=str(root / "psl-cache"))
     rows: list[dict] = []
     errors = Counter()
@@ -71,15 +81,17 @@ def inventory_domains(config: Config, manifest: dict, root: Path) -> dict:
             host = _host(decode_field(fields[1]))
             parent_id = parse_int(fields[3])
             recursion_level = parse_int(fields[4])
-            request_count = parse_int(fields[6])
+            request_count = parse_int(fields[5])
             if host is None:
                 errors["missing_host"] += 1
             if not is_null(fields[3]) and parent_id is None:
                 errors["invalid_parent_domain_id"] += 1
             if not is_null(fields[4]) and recursion_level is None:
                 errors["invalid_recursion_level"] += 1
-            if not is_null(fields[6]) and request_count is None:
+            if not is_null(fields[5]) and request_count is None:
                 errors["invalid_request_count"] += 1
+            elif is_null(fields[5]):
+                errors["missing_request_count"] += 1
             extracted = extractor(host or "")
             registrable = extracted.top_domain_under_public_suffix or host
             rows.append(
@@ -88,21 +100,14 @@ def inventory_domains(config: Config, manifest: dict, root: Path) -> dict:
                     "id": domain_id,
                     "parent_domain_id": parent_id,
                     "recursion_level": recursion_level,
-                    "status": decode_field(fields[5]),
-                    "request_count": request_count or 0,
+                    "request_count": request_count,
                     "host": host,
                     "registrable_domain": registrable,
                     "is_wikimedia": _is_wikimedia(host),
                 }
             )
     write_parquet_atomic(output, rows, DOMAIN_SCHEMA)
-    db = root / "analysis.duckdb"
-    connection = duckdb_connection(db, config.runtime.memory_limit, root / "duckdb-tmp")
-    escaped = str(output).replace("'", "''")
-    connection.execute(
-        f"CREATE OR REPLACE TABLE domains AS SELECT * FROM read_parquet('{escaped}')"
-    )
-    connection.execute("CREATE INDEX IF NOT EXISTS domains_id_idx ON domains(id)")
+    connection = _install_domain_table(config, root, output)
     aggregate = connection.execute(
         """
         SELECT count(*) AS rows,
@@ -118,6 +123,8 @@ def inventory_domains(config: Config, manifest: dict, root: Path) -> dict:
     ).fetchone()
     connection.close()
     summary = {
+        "schema_version": DOMAIN_INVENTORY_VERSION,
+        "source_sha256": source_sha256,
         "rows": aggregate[0],
         "distinct_ids": aggregate[1],
         "duplicate_ids": aggregate[2],
@@ -130,5 +137,16 @@ def inventory_domains(config: Config, manifest: dict, root: Path) -> dict:
     }
     from .io import atomic_json
 
-    atomic_json(root / "domain_summary.json", summary)
+    atomic_json(summary_path, summary)
     return summary
+
+
+def _install_domain_table(config: Config, root: Path, output: Path):
+    db = root / "analysis.duckdb"
+    connection = duckdb_connection(db, config.runtime.memory_limit, root / "duckdb-tmp")
+    escaped = str(output).replace("'", "''")
+    connection.execute(
+        f"CREATE OR REPLACE TABLE domains AS SELECT * FROM read_parquet('{escaped}')"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS domains_id_idx ON domains(id)")
+    return connection

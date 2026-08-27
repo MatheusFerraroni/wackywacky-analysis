@@ -15,7 +15,9 @@ No perfil `tiny`, `sample` lê janelas determinísticas distribuídas por `pages
 9. Frequências de formas/lemas usam spills e 256 partições; bigramas usam Space-Saving e recontagem exata. Tokenização e recontagem confirmam checkpoints independentes. O top-K só é publicado quando o limite do item omitido fica abaixo do último item publicado.
 10. A etapa de conteúdo caracteriza apenas `B_clean`, com checkpoint e fingerprint próprios. Ela mede frases, parágrafos, MATTR-100, classes gramaticais, repetição interna e sinais heurísticos sem excluir documentos.
 11. Trigramas não atravessam parágrafos e são recontados exatamente. PMI/NPMI usa marginais posicionais exatas dos bigramas e somente o universo certificado acima do limite do Space-Saving.
-12. `near-duplicates` é opcional: documentos com ≥50 palavras, shingles de cinco palavras, 112 MinHashes em 14×8 e confirmação por Jaccard ≥0,85.
+12. `B_clean_v2` remove, após confirmação privada, regras MediaWiki em linhas completas e repetição curta nas bordas com limiar `max(20, ceil(0,01 × N))`. Não remove substrings, repetição cross-domain nem linhas interiores por regra genérica. D4 deduplica novamente.
+13. Léxico e conteúdo v2 são coletados somente nos representantes D4; a recontagem exata de bigramas, trigramas e marginais usa uma única passagem retomável.
+14. `near-duplicates` é opcional: documentos com ≥50 palavras, shingles de cinco palavras, 112 MinHashes em 14×8 e confirmação por Jaccard ≥0,85.
 
 ## Atribuição a domínios
 
@@ -30,7 +32,7 @@ Hosts reais podem aparecer apenas nessas tabelas agregadas. Textos e URLs não e
 
 ## Léxico e figuras
 
-`B_clean` é a visão principal. `R_valid` e `E_exact` quantificam o efeito de validação, deduplicação e limpeza. Stopwords participam dos bigramas e são removidas apenas da apresentação dos rankings.
+`B_clean_v2` é a visão principal; `B_clean` é preservado lado a lado. `R_valid` e `E_exact` quantificam validação e deduplicação. Stopwords participam dos bigramas e são removidas apenas da apresentação dos rankings.
 
 As saídas incluem status, funil, quantis de tamanho, duplicação, remoção, rendimento por recursão, concentração por domínio, vocabulário, hapax, Zipf e rankings. Todas as figuras são geradas de CSVs agregados em `results/`, sem reler os TSVs.
 
@@ -45,5 +47,7 @@ A primeira versão não analisa tempo, segurança/ética, agrupamento temático 
 ## Reprodutibilidade e falhas
 
 Chunks são gravados como `.partial`, validados e renomeados antes de atualizar `state.json`. O índice versionado de candidatos confirma batches no próprio `.partial` e retoma da última chave. A etapa lexical registra offset, linha, índices de Parquet e estados completos de Space-Saving; após `SIGTERM`, retoma no último checkpoint e repete no máximo o trecho ainda não confirmado. Representantes são listas `u64` ordenadas consultadas por merge. DuckDB recebe limites explícitos de memória e temporários; filas e lotes spaCy são limitados por bytes. Mudança de fonte, configuração ou modelo invalida a retomada.
+
+A confirmação v2 parte de `boilerplate`; `conteúdo` e `incerto` viram exceções, e uma exceção MediaWiki desativa a regra inteira. Ela registra decisão do usuário, não precisão humana. `text_md5` é diagnosticado contra bytes descompactados, comprimidos, campo hexadecimal e texto normalizado, sem filtrar documentos.
 
 Parâmetros de near-duplicate seguem a configuração publicada do [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/v1.4.0/README.md); candidatos são confirmados por similaridade exata, em linha com [Lee et al. (2022)](https://aclanthology.org/2022.acl-long.577/).

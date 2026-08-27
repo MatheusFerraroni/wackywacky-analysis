@@ -26,10 +26,10 @@ DOMAIN_COLUMNS = (
     "url_md5",
     "parent_domain_id",
     "recursion_level",
-    "status",
     "request_count",
-    "created_at",
     "last_request_at",
+    "created_at",
+    "updated_at",
 )
 
 WIKIMEDIA_HOSTS = frozenset(

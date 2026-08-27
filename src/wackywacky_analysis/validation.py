@@ -121,3 +121,71 @@ def validate_invariants(
         result["bigram_marginals_reconciled"] = True
     atomic_json(root / "invariants.json", result)
     return result
+
+
+def validate_v2_invariants(clean: dict, lexical: dict, content: dict, root) -> dict:
+    """Validate only the products derived from B_clean_v2/D4."""
+    target = root / "v2"
+    documents = clean["d4_unique"]
+    if not (clean["d3_representatives"] >= clean["b_clean_v2_nonempty"] >= clean["d4_unique"]):
+        raise WackyWackyError("invariante falhou: funil B_clean_v2/D4 não é monotônico")
+    view = lexical["views"]["B_clean_v2"]
+    if view["documents"] != documents:
+        raise WackyWackyError("invariante falhou: documentos lexicais v2 não reconciliam")
+    for key, value in lexical["vocabulary"].items():
+        _view, kind = key.split(":", 1)
+        if kind in {"form", "lemma"} and value["occurrences"] != view["words"]:
+            raise WackyWackyError(f"invariante falhou: palavras v2 não reconciliam em {key}")
+    connection = duckdb.connect(str(target / "analysis.duckdb"), read_only=True)
+    invalid_df = connection.execute(
+        "SELECT count(*) FROM read_parquet(?) WHERE document_frequency>total_frequency",
+        [str(target / "vocabulary.parquet")],
+    ).fetchone()[0]
+    content_documents, content_words, sentences, paragraphs = connection.execute(
+        "SELECT count(*),sum(words),sum(sentences),sum(paragraphs) FROM content_document_statistics"
+    ).fetchone()
+    invalid_ngrams = connection.execute(
+        "SELECT "
+        "(SELECT count(*) FROM read_parquet(?) WHERE document_frequency>total_frequency),"
+        "(SELECT count(*) FROM read_parquet(?) WHERE document_frequency>total_frequency)",
+        [str(target / "bigrams.parquet"), str(target / "content_trigrams.parquet")],
+    ).fetchone()
+    histogram_totals = dict(
+        connection.execute(
+            "SELECT metric,sum(count) FROM read_parquet(?) "
+            "WHERE metric IN ('frases_por_documento','paragrafos_por_documento',"
+            "'palavras_por_frase','palavras_por_paragrafo') GROUP BY metric",
+            [str(target / "content_histograms.parquet")],
+        ).fetchall()
+    )
+    left_positions, right_positions = connection.execute(
+        "SELECT sum(left_count),sum(right_count) FROM read_parquet(?)",
+        [str(target / "content_bigram_marginals.parquet")],
+    ).fetchone()
+    connection.close()
+    if invalid_df or any(invalid_ngrams):
+        raise WackyWackyError("invariante falhou: DF v2 excede TF")
+    if content_documents != documents or content_words != view["words"]:
+        raise WackyWackyError("invariante falhou: conteúdo v2 não reconcilia")
+    if (
+        histogram_totals.get("frases_por_documento", 0) != documents
+        or histogram_totals.get("paragrafos_por_documento", 0) != documents
+        or histogram_totals.get("palavras_por_frase", 0) != sentences
+        or histogram_totals.get("palavras_por_paragrafo", 0) != paragraphs
+    ):
+        raise WackyWackyError("invariante falhou: histogramas v2 não reconciliam")
+    if (
+        left_positions != content["metrics"]["bigram_positions"]
+        or right_positions != content["metrics"]["bigram_positions"]
+    ):
+        raise WackyWackyError("invariante falhou: marginais v2 não reconciliam")
+    result = {
+        "funnel_v2_monotonic": True,
+        "vocabulary_v2_reconciled": True,
+        "content_v2_reconciled": True,
+        "document_frequency_v2_valid": True,
+        "content_histograms_v2_reconciled": True,
+        "bigram_marginals_v2_reconciled": True,
+    }
+    atomic_json(target / "invariants.json", result)
+    return result

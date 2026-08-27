@@ -88,6 +88,27 @@ def decode_text(field: bytes, md5_field: bytes, max_bytes: int) -> DecodedText:
     )
 
 
+def classify_text_md5(field: bytes, md5_field: bytes, decoded: DecodedText) -> str:
+    """Diagnose which stored representation a valid supplied MD5 describes."""
+    if md5_field in {b"", b"NULL", b"\\N"}:
+        return "missing"
+    supplied = md5_field.decode("ascii", "ignore")
+    if not _MD5.fullmatch(supplied):
+        return "invalid"
+    supplied = supplied.casefold()
+    compressed = bytes.fromhex(field.decode("ascii"))
+    variants = (
+        ("decompressed_bytes", decoded.raw),
+        ("compressed_bytes", compressed),
+        ("hexadecimal_field", field),
+        ("normalized_text", decoded.normalized.encode("utf-8")),
+    )
+    for label, value in variants:
+        if hashlib.md5(value, usedforsecurity=False).hexdigest() == supplied:
+            return label
+    return "mismatch_all_representations"
+
+
 def paragraph_units(text: str, minimum: int) -> list[tuple[int, int, str, str]]:
     units: list[tuple[int, int, str, str]] = []
     cursor = 0

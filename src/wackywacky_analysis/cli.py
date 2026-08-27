@@ -9,12 +9,13 @@ from .config import load_config
 from .errors import ReviewRequired, WackyWackyError
 from .io import atomic_json
 from .near import run_near_duplicates
-from .pipeline import locate_result, locate_root, run_pipeline
+from .pipeline import locate_result, locate_root, refresh_reports, run_pipeline
 from .progress import configure_logging
 from .reports import write_checksums, write_table
 from .review import export_review, import_review
 from .sampling import create_sample
 from .snapshot import verify_snapshot
+from .v2 import export_v2_review, import_v2_review
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,14 +33,21 @@ def _parser() -> argparse.ArgumentParser:
     export = review_commands.add_parser("export")
     export.add_argument("--config", required=True)
     export.add_argument("--output")
+    export.add_argument("--stage", choices=("v1", "v2"), default="v1")
     import_ = review_commands.add_parser("import")
     import_.add_argument("--config", required=True)
     import_.add_argument("--input", required=True)
+    import_.add_argument("--stage", choices=("v1", "v2"), default="v1")
     near = commands.add_parser("near-duplicates", help="executa a sensibilidade opcional")
     near.add_argument("--config", required=True)
     render = commands.add_parser("render", help="recria figuras somente dos agregados")
     render.add_argument("--config", required=True)
     render.add_argument("--snapshot-id")
+    refresh = commands.add_parser(
+        "refresh", help="recria tabelas e figuras usando somente artefatos concluídos"
+    )
+    refresh.add_argument("--config", required=True)
+    refresh.add_argument("--snapshot-id")
     return parser
 
 
@@ -78,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "review":
             manifest, root = locate_root(config)
             if arguments.review_command == "export":
-                output = export_review(
+                exporter = export_v2_review if arguments.stage == "v2" else export_review
+                output = exporter(
                     config,
                     manifest,
                     root,
@@ -96,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
             else:
-                _print(import_review(config, root, Path(arguments.input).resolve()))
+                importer = import_v2_review if arguments.stage == "v2" else import_review
+                _print(importer(config, root, Path(arguments.input).resolve()))
         elif arguments.command == "near-duplicates":
             manifest, root = locate_root(config)
             state = json.loads((root / "state.json").read_text())
@@ -123,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             render_all(result)
             write_checksums(result)
             _print({"status": "rendered", "result": str(result)})
+        elif arguments.command == "refresh":
+            _print(refresh_reports(config, arguments.snapshot_id))
         return 0
     except ReviewRequired as exc:
         print(str(exc), file=sys.stderr)

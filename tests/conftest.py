@@ -30,10 +30,10 @@ def domain_row(
             b"\xff\x00binary-md5",
             parent,
             str(level).encode(),
-            b"active",
             str(requests).encode(),
-            b"2026-08-20",
-            b"2026-08-20",
+            b"2026-08-20 00:00:00.000000",
+            b"2026-08-20 00:00:00",
+            b"2026-08-20 00:00:00.000000",
         ]
     )
 
@@ -141,6 +141,7 @@ def write_config(
     sampling_target: int = 10,
     sampling_candidates: int = 20,
     sampling_windows: int = 4,
+    boilerplate_v2: bool = False,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     max_rows = 0 if sampling or profile == "full" else 10_000
@@ -157,6 +158,28 @@ same_as_reserve = 2
 seed = 73129
 """
         if sampling
+        else ""
+    )
+    v2_block = (
+        """
+[boilerplate_v2]
+enabled = true
+short_line_min_chars = 3
+short_line_max_chars = 79
+short_line_min_alpha_tokens = 2
+short_line_max_words = 12
+short_pair_min_chars = 6
+short_pair_max_chars = 159
+edge_fraction = 0.10
+edge_min_lines = 3
+frequency_fraction = 0.01
+frequency_min_documents = 2
+review_mediawiki = 100
+review_lines = 100
+review_pairs = 100
+review_seed = 73129
+"""
+        if boilerplate_v2
         else ""
     )
     path.write_text(
@@ -197,6 +220,8 @@ review_blocks = 100
 review_seed = 73129
 precision_min = 0.0
 wilson_lower_min = 0.0
+
+{v2_block}
 
 [lexical]
 spacy_model = "blank:pt"

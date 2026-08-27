@@ -43,6 +43,23 @@ review_seed = 73129
 precision_min = 0.95
 wilson_lower_min = 0.90
 
+[boilerplate_v2]
+enabled = true
+short_line_min_chars = 3
+short_line_max_chars = 79
+short_line_min_alpha_tokens = 2
+short_line_max_words = 12
+short_pair_min_chars = 6
+short_pair_max_chars = 159
+edge_fraction = 0.10
+edge_min_lines = 3
+frequency_fraction = 0.01
+frequency_min_documents = 20
+review_mediawiki = 100
+review_lines = 100
+review_pairs = 100
+review_seed = 73129
+
 [lexical]
 spacy_model = "pt_core_news_sm"
 partitions = 256
