@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -76,6 +78,74 @@ def test_headerless_sources_are_validated_by_column_count(tmp_path: Path) -> Non
     manifest = verify_snapshot(config)
     assert manifest["sources"]["pages"]["header"] is False
     assert manifest["sources"]["domains"]["header"] is False
+
+
+def test_legacy_domain_header_manifest_is_migrated_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pages, domains = write_sources(tmp_path)
+    config = load_config(
+        write_config(
+            tmp_path / "config.toml", pages, domains, tmp_path / "work", tmp_path / "results"
+        )
+    )
+    manifest = verify_snapshot(config)
+    manifest_path = config.paths.work / manifest["snapshot_id"] / "manifest.json"
+    legacy = deepcopy(manifest)
+    legacy["schema_version"] = 1
+    legacy["sources"]["domains"]["header"] = False
+    legacy.pop("migrations")
+    atomic_json(manifest_path, legacy)
+
+    with caplog.at_level(logging.WARNING):
+        migrated = verify_snapshot(config)
+    assert migrated["schema_version"] == 2
+    assert migrated["sources"]["domains"]["header"] is True
+    assert [item["id"] for item in migrated["migrations"]] == ["domain-header-schema-v2"]
+    assert "identidade física confirmada" in caplog.text
+    repeated = verify_snapshot(config)
+    assert repeated["migrations"] == migrated["migrations"]
+
+
+def test_legacy_domain_header_migration_rejects_any_other_difference(tmp_path: Path) -> None:
+    pages, domains = write_sources(tmp_path)
+    config = load_config(
+        write_config(
+            tmp_path / "config.toml", pages, domains, tmp_path / "work", tmp_path / "results"
+        )
+    )
+    manifest = verify_snapshot(config)
+    manifest_path = config.paths.work / manifest["snapshot_id"] / "manifest.json"
+    legacy = deepcopy(manifest)
+    legacy["schema_version"] = 1
+    legacy["sources"]["domains"]["header"] = False
+    legacy.pop("migrations")
+
+    invalid_manifests = []
+    for field in ("size", "mtime_ns", "columns"):
+        invalid = deepcopy(legacy)
+        invalid["sources"]["domains"][field] += 1
+        invalid_manifests.append(invalid)
+    invalid = deepcopy(legacy)
+    invalid["sources"]["domains"]["sha256"] = "0" * 64
+    invalid_manifests.append(invalid)
+    invalid = deepcopy(legacy)
+    invalid["sources"]["pages"]["header"] = False
+    invalid_manifests.append(invalid)
+    invalid = deepcopy(legacy)
+    invalid["config_sha256"] = "0" * 64
+    invalid_manifests.append(invalid)
+    invalid = deepcopy(legacy)
+    invalid["migrations"] = [{"id": "unknown"}]
+    invalid_manifests.append(invalid)
+    invalid = deepcopy(legacy)
+    invalid["schema_version"] = 99
+    invalid_manifests.append(invalid)
+
+    for invalid in invalid_manifests:
+        atomic_json(manifest_path, invalid)
+        with pytest.raises(SourceChangedError):
+            verify_snapshot(config)
 
 
 def test_wilson_gate_requires_enough_correct_reviews() -> None:

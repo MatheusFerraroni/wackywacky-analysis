@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,64 @@ from .io import atomic_json, sha256_file
 from .progress import ByteProgress
 from .sampling import analysis_paths
 from .schema import DOMAIN_COLUMNS, PAGES_COLUMNS
+
+LOGGER = logging.getLogger(__name__)
+SNAPSHOT_SCHEMA_VERSION = 2
+DOMAIN_HEADER_MIGRATION = "domain-header-schema-v2"
+DOMAIN_HEADER_MIGRATION_RECORD = {
+    "id": DOMAIN_HEADER_MIGRATION,
+    "source": "domains",
+    "field": "header",
+    "from": False,
+    "to": True,
+    "reason": "schema real de domain.tsv corrigido",
+}
+
+
+def _domain_header_migration(old: dict[str, Any], current: dict[str, Any], config: Config) -> bool:
+    """Accept only the legacy false negative fixed by the real domain schema."""
+    if old.get("schema_version") != 1 or config.source.header != "auto":
+        return False
+    if old.get("config_sha256") != current["config_sha256"]:
+        return False
+    old_sources = old.get("sources")
+    if not isinstance(old_sources, dict) or old_sources.get("pages") != current["sources"]["pages"]:
+        return False
+    old_domains = old_sources.get("domains")
+    if not isinstance(old_domains, dict):
+        return False
+    expected_legacy_domains = dict(current["sources"]["domains"])
+    expected_legacy_domains["header"] = False
+    return (
+        current["sources"]["domains"]["header"] is True and old_domains == expected_legacy_domains
+    )
+
+
+def _validate_previous_manifest(
+    old: dict[str, Any], current: dict[str, Any], config: Config
+) -> list[dict[str, Any]]:
+    if old.get("schema_version") not in {1, SNAPSHOT_SCHEMA_VERSION}:
+        raise SourceChangedError("schema do manifesto existente não é suportado")
+    if old.get("config_sha256") != current["config_sha256"]:
+        raise SourceChangedError("snapshot existente é incompatível com fonte ou configuração")
+    migrations = old.get("migrations", [])
+    if (
+        not isinstance(migrations, list)
+        or any(item != DOMAIN_HEADER_MIGRATION_RECORD for item in migrations)
+        or len(migrations) > 1
+    ):
+        raise SourceChangedError("registro de migrações do manifesto é inválido")
+    if old.get("sources") == current["sources"]:
+        return migrations
+    if not _domain_header_migration(old, current, config):
+        raise SourceChangedError("snapshot existente é incompatível com fonte ou configuração")
+    if not any(item.get("id") == DOMAIN_HEADER_MIGRATION for item in migrations):
+        migrations = [*migrations, dict(DOMAIN_HEADER_MIGRATION_RECORD)]
+    LOGGER.warning(
+        "Manifesto: migrando somente domains.header de false para true; "
+        "identidade física confirmada"
+    )
+    return migrations
 
 
 def _header_state(path: Path, expected: tuple[str, ...], mode: str, max_line: int) -> bool:
@@ -75,7 +134,7 @@ def verify_snapshot(config: Config, *, persist: bool = True) -> dict[str, Any]:
         else f"{config.cutoff_date.replace('-', '')}-{pages_sha[:12]}"
     )
     manifest = {
-        "schema_version": 1,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "snapshot_id": snapshot_id,
         "cutoff_date": config.cutoff_date,
         "config_sha256": config.fingerprint,
@@ -98,6 +157,7 @@ def verify_snapshot(config: Config, *, persist: bool = True) -> dict[str, Any]:
             },
         },
         "scratch_free_bytes_at_verify": free,
+        "migrations": [],
     }
     if inputs.sampling:
         manifest["sampling"] = inputs.sampling
@@ -108,10 +168,9 @@ def verify_snapshot(config: Config, *, persist: bool = True) -> dict[str, Any]:
             from .io import read_json
 
             old = read_json(previous)
-            if old["config_sha256"] != config.fingerprint or old["sources"] != manifest["sources"]:
-                raise SourceChangedError(
-                    "snapshot existente é incompatível com fonte ou configuração"
-                )
+            if not isinstance(old, dict):
+                raise SourceChangedError("manifesto existente é inválido")
+            manifest["migrations"] = _validate_previous_manifest(old, manifest, config)
         atomic_json(previous, manifest)
     return manifest
 

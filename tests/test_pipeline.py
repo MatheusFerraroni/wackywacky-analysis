@@ -10,6 +10,7 @@ from conftest import domain_row, page_row, write_config, write_sources
 
 from wackywacky_analysis.config import load_config
 from wackywacky_analysis.errors import ReviewRequired, WackyWackyError
+from wackywacky_analysis.io import atomic_json
 from wackywacky_analysis.near import run_near_duplicates
 from wackywacky_analysis.pipeline import refresh_reports, run_pipeline
 from wackywacky_analysis.review import export_review, import_review
@@ -139,6 +140,13 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
         "content_histograms.parquet",
     )
     before = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in scientific}
+    state_before = (root / "state.json").read_bytes()
+    manifest_path = root / "manifest.json"
+    legacy_manifest = json.loads(manifest_path.read_text())
+    legacy_manifest["schema_version"] = 1
+    legacy_manifest["sources"]["domains"]["header"] = False
+    legacy_manifest.pop("migrations")
+    atomic_json(manifest_path, legacy_manifest)
     (root / "domains.parquet").write_bytes((root / "domains-v2.parquet").read_bytes())
     (root / "domain_summary.json").write_text('{"schema_version":1,"requests":0}')
     (root / "domains-v2.parquet").unlink()
@@ -148,6 +156,10 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     assert refreshed["status"] == "refreshed"
     assert (result / "revisions" / "method-v1" / "summary.json").is_file()
     summary = json.loads((result / "summary.json").read_text())
+    migrated_manifest = json.loads(manifest_path.read_text())
+    assert migrated_manifest["schema_version"] == 2
+    assert migrated_manifest["sources"]["domains"]["header"] is True
+    assert [item["id"] for item in migrated_manifest["migrations"]] == ["domain-header-schema-v2"]
     assert summary["domains"]["schema_version"] == 2
     assert summary["domains"]["requests"] == 220
     assert "nan" not in "\n".join(
@@ -156,6 +168,7 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     )
     after = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in scientific}
     assert before == after
+    assert (root / "state.json").read_bytes() == state_before
 
 
 def test_full_profile_worker_count_does_not_change_aggregates(tmp_path: Path) -> None:

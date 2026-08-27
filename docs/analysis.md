@@ -48,6 +48,8 @@ A primeira versão não analisa tempo, segurança/ética, agrupamento temático 
 
 Chunks são gravados como `.partial`, validados e renomeados antes de atualizar `state.json`. O índice versionado de candidatos confirma batches no próprio `.partial` e retoma da última chave. A etapa lexical registra offset, linha, índices de Parquet e estados completos de Space-Saving; após `SIGTERM`, retoma no último checkpoint e repete no máximo o trecho ainda não confirmado. Representantes são listas `u64` ordenadas consultadas por merge. DuckDB recebe limites explícitos de memória e temporários; filas e lotes spaCy são limitados por bytes. Mudança de fonte, configuração ou modelo invalida a retomada.
 
+O manifesto v2 aceita somente a migração auditada de `domains.header=false` para `true` causada pela correção do schema real, exigindo configuração, SHA-256, tamanho, `mtime` e demais metadados idênticos.
+
 A confirmação v2 parte de `boilerplate`; `conteúdo` e `incerto` viram exceções, e uma exceção MediaWiki desativa a regra inteira. Ela registra decisão do usuário, não precisão humana. `text_md5` é diagnosticado contra bytes descompactados, comprimidos, campo hexadecimal e texto normalizado, sem filtrar documentos.
 
 Parâmetros de near-duplicate seguem a configuração publicada do [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/v1.4.0/README.md); candidatos são confirmados por similaridade exata, em linha com [Lee et al. (2022)](https://aclanthology.org/2022.acl-long.577/).
