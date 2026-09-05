@@ -117,8 +117,12 @@ def test_pipeline_review_resume_reports_and_public_invariants(tmp_path: Path) ->
 
 def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pages, domains = write_sources(tmp_path)
+    with domains.open("ab") as handle:
+        handle.write(domain_row(3, b"https://child-a.invalid", parent=b"1", requests=0) + b"\n")
+        handle.write(domain_row(4, b"https://child-b.invalid", parent=b"1", requests=0) + b"\n")
     config = load_config(
         write_config(
             tmp_path / "config.toml", pages, domains, tmp_path / "work", tmp_path / "results"
@@ -131,6 +135,12 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     sample = root / "review" / "boilerplate-review.csv"
     import_review(config, root, sample)
     result = Path(run_pipeline(config, resume=True)["result"])
+    children_csv = result / "tables" / "08b_dominios_filhos.csv"
+    children_tex = children_csv.with_suffix(".tex")
+    expected_children = children_csv.read_bytes()
+    # Simulate a completed snapshot produced before this table existed.
+    children_csv.unlink()
+    children_tex.unlink()
     scientific = (
         "d1_groups.parquet",
         "d2_groups.parquet",
@@ -152,6 +162,21 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     (root / "domains-v2.parquet").unlink()
     (root / "domains-v2.parquet.sha256").unlink()
     (root / "domain_summary-v2.json").unlink()
+
+    def forbid_text_processing(*args, **kwargs):
+        pytest.fail("refresh must not repeat any textual processing")
+
+    for name in (
+        "scan_pages",
+        "reduce_exact",
+        "clean_representatives",
+        "lexical_pass",
+        "content_pass",
+        "discover_v2_candidates",
+        "clean_v2",
+        "lexical_content_v2_pass",
+    ):
+        monkeypatch.setattr(f"wackywacky_analysis.pipeline.{name}", forbid_text_processing)
     refreshed = refresh_reports(config, manifest["snapshot_id"])
     assert refreshed["status"] == "refreshed"
     assert (result / "revisions" / "method-v1" / "summary.json").is_file()
@@ -162,6 +187,31 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     assert [item["id"] for item in migrated_manifest["migrations"]] == ["domain-header-schema-v2"]
     assert summary["domains"]["schema_version"] == 2
     assert summary["domains"]["requests"] == 220
+    assert children_csv.read_bytes() == expected_children
+    assert children_tex.is_file()
+    with children_csv.open(encoding="utf-8", newline="") as handle:
+        children = list(csv.DictReader(handle))
+    assert len(children) == 1
+    assert children[0]["filhos"] == "2"
+    assert float(children[0]["percentual"]) == 50
+    assert float(children[0]["media_requisicoes_filhos"]) == 0
+    audit = summary["domain_children"]
+    assert audit["denominator_domains"] == 4
+    assert audit["domains_without_parent"] == 1
+    assert audit["domains_with_missing_parent"] == 1
+    assert audit["domains_with_known_parent"] == 2
+    assert audit["counts_reconciled"] is True
+    checksums = {
+        name: digest
+        for digest, name in (
+            line.split("  ", 1) for line in (result / "checksums.sha256").read_text().splitlines()
+        )
+    }
+    for path in (children_csv, children_tex):
+        assert (
+            checksums[path.relative_to(result).as_posix()]
+            == hashlib.sha256(path.read_bytes()).hexdigest()
+        )
     assert "nan" not in "\n".join(
         path.read_text(encoding="utf-8", errors="ignore").casefold()
         for path in result.rglob("*.csv")

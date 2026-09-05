@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .config import Config
+from .errors import WackyWackyError
 from .io import atomic_json, read_json, sha256_file
 from .noise import MEDIAWIKI_RULESET_VERSION, is_presentation_noise
 from .storage import duckdb_connection
@@ -156,8 +157,6 @@ def build_reports(
     near_path = root / "near_summary.json"
     if near_path.exists():
         summary["near_duplicates"] = json.loads(near_path.read_text())
-    atomic_json(result / "summary.json", summary)
-
     write_table(
         tables,
         "01_snapshot",
@@ -314,13 +313,14 @@ def build_reports(
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
     )
-    _domain_and_level_tables(
+    summary["domain_children"] = _domain_and_level_tables(
         connection,
         tables,
         figures_data,
         sampled=sampled,
         v2_root=main_root if has_v2 else None,
     )
+    atomic_json(result / "summary.json", summary)
     _distribution_tables(connection, root, figures_data, v2_root=main_root if has_v2 else None)
     vocab_rows = [
         (
@@ -1115,7 +1115,7 @@ def _domain_and_level_tables(
     *,
     sampled: bool,
     v2_root: Path | None = None,
-) -> None:
+) -> dict:
     connection.execute(
         """
         CREATE OR REPLACE TEMP VIEW canonical_domains AS
@@ -1361,6 +1361,90 @@ def _domain_and_level_tables(
         if index % stride == 0 or index == count:
             lorenz.append((index / count, cumulative / total if total else 0))
     write_table(aggregates, "lorenz", ["fracao_dominios", "fracao_palavras"], lorenz)
+    return _domain_children_table(connection, tables, sampled=sampled)
+
+
+def _domain_children_table(connection, tables: Path, *, sampled: bool) -> dict:
+    """Rank direct discovery parents using only the domain inventory."""
+    connection.execute(
+        """
+        CREATE OR REPLACE TEMP VIEW report_domain_children AS
+        WITH canonical AS (
+          SELECT * EXCLUDE(rn) FROM (
+            SELECT *, row_number() OVER (PARTITION BY id ORDER BY row_number) rn FROM domains
+          ) WHERE rn=1
+        )
+        SELECT child.id, child.parent_domain_id, child.request_count,
+               parent.id AS known_parent_id, parent.host AS parent_host
+        FROM canonical child LEFT JOIN canonical parent ON child.parent_domain_id=parent.id
+        """
+    )
+    total, without_parent, missing_parent, missing_requests = connection.execute(
+        """
+        SELECT count(*),
+               count(*) FILTER (WHERE parent_domain_id IS NULL),
+               count(*) FILTER (WHERE parent_domain_id IS NOT NULL AND known_parent_id IS NULL),
+               count(*) FILTER (WHERE known_parent_id IS NOT NULL AND request_count IS NULL)
+        FROM report_domain_children
+        """
+    ).fetchone()
+    connection.execute(
+        """
+        CREATE OR REPLACE TEMP VIEW report_domain_children_counts AS
+        SELECT known_parent_id AS parent_id, parent_host AS host, count(*) AS children,
+               avg(request_count) AS mean_requests,
+               count(*) FILTER (WHERE request_count IS NULL) AS missing_requests
+        FROM report_domain_children WHERE known_parent_id IS NOT NULL
+        GROUP BY known_parent_id, parent_host
+        """
+    )
+    parents, linked_children = connection.execute(
+        "SELECT count(*), coalesce(sum(children),0) FROM report_domain_children_counts"
+    ).fetchone()
+    reconciled = total == without_parent + missing_parent + linked_children
+    if not reconciled:
+        raise WackyWackyError("contagens de domínios filhos não reconciliadas")
+    rows = connection.execute(
+        """
+        SELECT host, children, 100.0*children/nullif(?,0), mean_requests, missing_requests
+        FROM report_domain_children_counts
+        ORDER BY children DESC, host ASC NULLS LAST, parent_id ASC LIMIT 15
+        """,
+        [total],
+    ).fetchall()
+    write_table(
+        tables,
+        "08b_dominios_filhos",
+        ["host", "filhos", "percentual", "media_requisicoes_filhos", "filhos_sem_requisicoes"],
+        [
+            (
+                host if host is not None else "host ausente",
+                children,
+                percentage,
+                mean if mean is not None else "não disponível",
+                missing,
+            )
+            for host, children, percentage, mean, missing in rows
+        ],
+    )
+    return {
+        "scope": "prévia amostral não representativa"
+        if sampled
+        else "snapshot integral configurado",
+        "relationship": "filhos diretos por parent_domain_id; origem da descoberta",
+        "unit": "domain_id distinto; primeira linha por ID",
+        "percentage_definition": "100 * filhos / denominator_domains; inclui todos os domínios",
+        "mean_requests_definition": "média de request_count dos filhos; inclui zero, exclui ausentes",
+        "denominator_domains": total,
+        "domains_without_parent": without_parent,
+        "domains_with_missing_parent": missing_parent,
+        "domains_with_known_parent": linked_children,
+        "parents_with_children": parents,
+        "children_with_missing_request_count": missing_requests,
+        "published_parents": len(rows),
+        "published_children": sum(row[1] for row in rows),
+        "counts_reconciled": reconciled,
+    }
 
 
 def _distribution_tables(

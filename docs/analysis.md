@@ -23,6 +23,8 @@ No perfil `tiny`, `sample` lê janelas determinísticas distribuídas por `pages
 
 `parent_domain_id` representa origem da descoberta, não propriedade. Wikimedia é uma lista explícita de famílias de domínio, nunca busca pela substring `wiki`.
 
+`08b_dominios_filhos` ordena os 15 pais com mais filhos diretos, desempatando por host e ID. Cada domínio é um ID distinto (primeira linha em caso de duplicata); o percentual é `100 × filhos / total de domínios`, incluindo no denominador os domínios sem pai e com pai ausente. A média usa o `request_count` dos filhos, inclui zeros e exclui nulos, contados em `filhos_sem_requisicoes`; sem valores, mostra “não disponível”. `summary.domain_children` reconcilia filhos com pai conhecido + domínios sem pai + referências a pai ausente. No `tiny` amostrado, o recorte descreve somente os domínios incluídos na amostra e sua cadeia de pais.
+
 Conteúdo cross-domain possui duas leituras:
 
 - `page-weighted`: descreve o volume efetivamente coletado;
