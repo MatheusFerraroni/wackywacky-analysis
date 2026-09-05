@@ -72,9 +72,12 @@ Comandos independentes:
 uv run wackywacky near-duplicates --config configs/full.toml
 uv run wackywacky render --config configs/full.toml --snapshot-id SNAPSHOT_ID
 uv run wackywacky refresh --config configs/full.toml --snapshot-id SNAPSHOT_ID
+uv run python scripts/export_text_length_histogram.py --config configs/full.toml --snapshot-id SNAPSHOT_ID
 ```
 
 `refresh` corrige inventário, tabelas e figuras sem repetir as passagens textuais; a primeira saída existente é preservada em `revisions/method-v1/`. `render` lê somente agregados.
+
+O script de histograma lê apenas os Parquets lexicais concluídos de `B_clean_v2`. Por padrão, gera 100 intervalos entre 2 e 9.999 caracteres, no formato `left,right,mid,count`, registra exclusões em um JSON adjacente e atualiza os checksums públicos.
 
 `run` e `refresh` também geram `tables/08b_dominios_filhos.csv` e `.tex`: os 15 pais com mais filhos diretos, percentual dos domínios e média de requisições dos filhos. `07b_estatisticas_dominios_por_nivel` resume domínios, requisições, percentuais e média por nível de recursão. Denominadores e reconciliações ficam em `summary.json`, nos campos `domain_children` e `domain_levels`.
 

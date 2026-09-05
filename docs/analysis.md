@@ -40,6 +40,8 @@ Hosts reais podem aparecer apenas nessas tabelas agregadas. Textos e URLs não e
 
 As saídas incluem status, funil, quantis de tamanho, duplicação, remoção, rendimento por recursão, concentração por domínio, vocabulário, hapax, Zipf e rankings. Todas as figuras são geradas de CSVs agregados em `results/`, sem reler os TSVs.
 
+O histograma adicional de caracteres é derivado dos Parquets lexicais de `B_clean_v2`, sem nova tokenização. Seus intervalos são fechados à esquerda e abertos à direita, exceto o último, e um JSON adjacente registra os limites e documentos fora da faixa.
+
 Frases são delimitadas pelo `sentencizer` do spaCy e por limites de parágrafo. A tokenização cobre o documento inteiro; POS, morfologia e lematização são inferidos em blocos determinísticos de até 1.024 tokens para limitar a memória, portanto as bordas dos blocos não compartilham contexto do modelo. MATTR é calculado apenas em documentos com pelo menos 100 palavras. POS e morfologia são estimativas do modelo, não anotações humanas. Repetição e sinais de fragmentação, extensão, pontuação, conteúdo não lexical e mojibake são indicadores descritivos e não filtros.
 
 A acumulação do vocabulário usa uma ordem aleatória determinística baseada em SHA-256; não representa tempo nem a ordem física do TSV. Perfis textuais de domínio exigem ao menos 20 documentos e são limitados aos 100 maiores por palavras.
