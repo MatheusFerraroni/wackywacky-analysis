@@ -137,10 +137,15 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     result = Path(run_pipeline(config, resume=True)["result"])
     children_csv = result / "tables" / "08b_dominios_filhos.csv"
     children_tex = children_csv.with_suffix(".tex")
+    levels_csv = result / "tables" / "07b_estatisticas_dominios_por_nivel.csv"
+    levels_tex = levels_csv.with_suffix(".tex")
     expected_children = children_csv.read_bytes()
+    expected_levels = levels_csv.read_bytes()
     # Simulate a completed snapshot produced before this table existed.
     children_csv.unlink()
     children_tex.unlink()
+    levels_csv.unlink()
+    levels_tex.unlink()
     scientific = (
         "d1_groups.parquet",
         "d2_groups.parquet",
@@ -189,6 +194,8 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     assert summary["domains"]["requests"] == 220
     assert children_csv.read_bytes() == expected_children
     assert children_tex.is_file()
+    assert levels_csv.read_bytes() == expected_levels
+    assert levels_tex.is_file()
     with children_csv.open(encoding="utf-8", newline="") as handle:
         children = list(csv.DictReader(handle))
     assert len(children) == 1
@@ -201,13 +208,18 @@ def test_refresh_migrates_domain_inventory_without_touching_scientific_artifacts
     assert audit["domains_with_missing_parent"] == 1
     assert audit["domains_with_known_parent"] == 2
     assert audit["counts_reconciled"] is True
+    level_audit = summary["domain_levels"]
+    assert level_audit["denominator_domains"] == 4
+    assert level_audit["denominator_requests"] == 220
+    assert level_audit["domains_reconciled"] is True
+    assert level_audit["requests_reconciled"] is True
     checksums = {
         name: digest
         for digest, name in (
             line.split("  ", 1) for line in (result / "checksums.sha256").read_text().splitlines()
         )
     }
-    for path in (children_csv, children_tex):
+    for path in (children_csv, children_tex, levels_csv, levels_tex):
         assert (
             checksums[path.relative_to(result).as_posix()]
             == hashlib.sha256(path.read_bytes()).hexdigest()

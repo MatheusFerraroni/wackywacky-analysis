@@ -313,12 +313,14 @@ def build_reports(
     connection = duckdb_connection(
         root / "analysis.duckdb", config.runtime.memory_limit, root / "duckdb-tmp"
     )
-    summary["domain_children"] = _domain_and_level_tables(
-        connection,
-        tables,
-        figures_data,
-        sampled=sampled,
-        v2_root=main_root if has_v2 else None,
+    summary.update(
+        _domain_and_level_tables(
+            connection,
+            tables,
+            figures_data,
+            sampled=sampled,
+            v2_root=main_root if has_v2 else None,
+        )
     )
     atomic_json(result / "summary.json", summary)
     _distribution_tables(connection, root, figures_data, v2_root=main_root if has_v2 else None)
@@ -1115,7 +1117,7 @@ def _domain_and_level_tables(
     *,
     sampled: bool,
     v2_root: Path | None = None,
-) -> dict:
+) -> dict[str, dict]:
     connection.execute(
         """
         CREATE OR REPLACE TEMP VIEW canonical_domains AS
@@ -1179,6 +1181,7 @@ def _domain_and_level_tables(
         ["nivel", "palavras_por_mil_requisicoes", "aplicavel"],
         ((row[0], "" if sampled else row[-1] or 0, not sampled) for row in levels),
     )
+    domain_levels = _domain_levels_table(connection, tables, sampled=sampled)
     if v2_root:
         connection.execute(
             """
@@ -1361,7 +1364,68 @@ def _domain_and_level_tables(
         if index % stride == 0 or index == count:
             lorenz.append((index / count, cumulative / total if total else 0))
     write_table(aggregates, "lorenz", ["fracao_dominios", "fracao_palavras"], lorenz)
-    return _domain_children_table(connection, tables, sampled=sampled)
+    return {
+        "domain_children": _domain_children_table(connection, tables, sampled=sampled),
+        "domain_levels": domain_levels,
+    }
+
+
+def _domain_levels_table(connection, tables: Path, *, sampled: bool) -> dict:
+    total_domains, total_requests, missing_levels, missing_requests = connection.execute(
+        """
+        SELECT count(*), coalesce(sum(request_count),0),
+               count(*) FILTER (WHERE recursion_level IS NULL),
+               count(*) FILTER (WHERE request_count IS NULL)
+        FROM canonical_domains
+        """
+    ).fetchone()
+    rows = connection.execute(
+        """
+        SELECT coalesce(cast(recursion_level AS varchar),'ausente') AS level,
+               count(*) AS domains,
+               100.0*count(*)/nullif(?,0) AS domain_percentage,
+               coalesce(sum(request_count),0) AS requests,
+               100.0*coalesce(sum(request_count),0)/nullif(?,0) AS request_percentage,
+               avg(request_count) AS mean_requests
+        FROM canonical_domains GROUP BY recursion_level
+        ORDER BY recursion_level ASC NULLS LAST
+        """,
+        [total_domains, total_requests],
+    ).fetchall()
+    domain_sum = sum(row[1] for row in rows)
+    request_sum = sum(row[3] for row in rows)
+    domains_reconciled = domain_sum == total_domains
+    requests_reconciled = request_sum == total_requests
+    if not domains_reconciled or not requests_reconciled:
+        raise WackyWackyError("estatísticas de domínios por nível não reconciliadas")
+    write_table(
+        tables,
+        "07b_estatisticas_dominios_por_nivel",
+        [
+            "nivel",
+            "dominios",
+            "percentual_dominios",
+            "requisicoes",
+            "percentual_requisicoes",
+            "media_requisicoes_por_dominio",
+        ],
+        [(*row[:-1], row[-1] if row[-1] is not None else "não disponível") for row in rows],
+    )
+    return {
+        "scope": "prévia amostral não representativa"
+        if sampled
+        else "snapshot integral configurado",
+        "unit": "domain_id distinto; primeira linha por ID",
+        "percentage_definition": "percentuais sobre todos os domínios e suas requisições",
+        "mean_requests_definition": "média de request_count por nível; inclui zero, exclui ausentes",
+        "denominator_domains": total_domains,
+        "denominator_requests": total_requests,
+        "domains_with_missing_level": missing_levels,
+        "domains_with_missing_request_count": missing_requests,
+        "level_rows": len(rows),
+        "domains_reconciled": domains_reconciled,
+        "requests_reconciled": requests_reconciled,
+    }
 
 
 def _domain_children_table(connection, tables: Path, *, sampled: bool) -> dict:

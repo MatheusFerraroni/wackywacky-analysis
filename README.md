@@ -76,7 +76,7 @@ uv run wackywacky refresh --config configs/full.toml --snapshot-id SNAPSHOT_ID
 
 `refresh` corrige inventário, tabelas e figuras sem repetir as passagens textuais; a primeira saída existente é preservada em `revisions/method-v1/`. `render` lê somente agregados.
 
-`run` e `refresh` também geram `tables/08b_dominios_filhos.csv` e `.tex`: os 15 pais com mais filhos diretos, percentual dos domínios e média de requisições dos filhos. O denominador e a reconciliação ficam em `summary.json`, no campo `domain_children`.
+`run` e `refresh` também geram `tables/08b_dominios_filhos.csv` e `.tex`: os 15 pais com mais filhos diretos, percentual dos domínios e média de requisições dos filhos. `07b_estatisticas_dominios_por_nivel` resume domínios, requisições, percentuais e média por nível de recursão. Denominadores e reconciliações ficam em `summary.json`, nos campos `domain_children` e `domain_levels`.
 
 Alterações apenas no estilo das figuras continuam exigindo somente `render`. Alterações nas métricas de `[content]` retomam apenas a análise de conteúdo.
 

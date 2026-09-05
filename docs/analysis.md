@@ -25,6 +25,8 @@ No perfil `tiny`, `sample` lê janelas determinísticas distribuídas por `pages
 
 `08b_dominios_filhos` ordena os 15 pais com mais filhos diretos, desempatando por host e ID. Cada domínio é um ID distinto (primeira linha em caso de duplicata); o percentual é `100 × filhos / total de domínios`, incluindo no denominador os domínios sem pai e com pai ausente. A média usa o `request_count` dos filhos, inclui zeros e exclui nulos, contados em `filhos_sem_requisicoes`; sem valores, mostra “não disponível”. `summary.domain_children` reconcilia filhos com pai conhecido + domínios sem pai + referências a pai ausente. No `tiny` amostrado, o recorte descreve somente os domínios incluídos na amostra e sua cadeia de pais.
 
+`07b_estatisticas_dominios_por_nivel` agrega os domínios por `recursion_level`. Os percentuais usam, respectivamente, todos os domínios distintos e a soma de `request_count`; a média inclui zeros e exclui valores ausentes. Níveis ausentes aparecem separadamente. `summary.domain_levels` registra os denominadores, ausências e reconciliações.
+
 Conteúdo cross-domain possui duas leituras:
 
 - `page-weighted`: descreve o volume efetivamente coletado;

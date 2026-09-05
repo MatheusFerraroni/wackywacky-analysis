@@ -187,6 +187,8 @@ def test_sampled_pipeline_marks_preview_and_disables_request_yield(tmp_path: Pat
     assert summary["scope"] == "prévia amostral não representativa"
     assert summary["domain_children"]["scope"] == summary["scope"]
     assert summary["domain_children"]["denominator_domains"] == summary["domains"]["distinct_ids"]
+    assert summary["domain_levels"]["scope"] == summary["scope"]
+    assert summary["domain_levels"]["denominator_domains"] == summary["domains"]["distinct_ids"]
     yield_table = (result / "tables" / "07_rendimento_nivel.csv").read_text(encoding="utf-8")
     assert "não aplicável" in yield_table
     yield_aggregate = (result / "aggregates" / "rendimento_nivel.csv").read_text(encoding="utf-8")

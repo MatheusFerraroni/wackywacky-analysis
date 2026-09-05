@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from wackywacky_analysis.reports import _domain_children_table
+from wackywacky_analysis.reports import _domain_children_table, _domain_levels_table
 
 
 def _report(root: Path, rows: list[tuple], *, sampled: bool = False) -> tuple[dict, list[dict]]:
@@ -103,3 +103,61 @@ def test_empty_child_rankings_remain_valid(tmp_path: Path, rows: list[tuple]) ->
     assert summary["domains_with_known_parent"] == 0
     assert summary["counts_reconciled"] is True
     assert summary["scope"] == "prévia amostral não representativa"
+
+
+def test_domain_levels_percentages_means_and_missing_values_reconcile(tmp_path: Path) -> None:
+    rows = [
+        (1, 1, "root.invalid", None, 100, 0),
+        (2, 2, "a.invalid", 1, 0, 1),
+        (3, 3, "b.invalid", 1, 20, 1),
+        (4, 4, "c.invalid", 1, None, 1),
+        (5, 5, "d.invalid", 2, 30, 2),
+        (6, 6, "missing-level.invalid", None, 50, None),
+        (99, 2, "ignored-duplicate.invalid", 1, 999, 2),
+    ]
+    with duckdb.connect() as connection:
+        connection.execute("SET memory_limit='64MiB'")
+        connection.execute(
+            "CREATE TABLE domains(row_number BIGINT, id BIGINT, host VARCHAR, "
+            "parent_domain_id BIGINT, request_count BIGINT, recursion_level INTEGER)"
+        )
+        connection.executemany("INSERT INTO domains VALUES (?,?,?,?,?,?)", rows)
+        connection.execute(
+            """
+            CREATE TEMP VIEW canonical_domains AS
+            SELECT * EXCLUDE(rn) FROM (
+              SELECT *,row_number() OVER(PARTITION BY id ORDER BY row_number) rn FROM domains
+            ) WHERE rn=1
+            """
+        )
+        summary = _domain_levels_table(connection, tmp_path, sampled=False)
+    with (tmp_path / "07b_estatisticas_dominios_por_nivel.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        table = list(csv.DictReader(handle))
+    assert summary == {
+        "scope": "snapshot integral configurado",
+        "unit": "domain_id distinto; primeira linha por ID",
+        "percentage_definition": "percentuais sobre todos os domínios e suas requisições",
+        "mean_requests_definition": "média de request_count por nível; inclui zero, exclui ausentes",
+        "denominator_domains": 6,
+        "denominator_requests": 200,
+        "domains_with_missing_level": 1,
+        "domains_with_missing_request_count": 1,
+        "level_rows": 4,
+        "domains_reconciled": True,
+        "requests_reconciled": True,
+    }
+    assert [row["nivel"] for row in table] == ["0", "1", "2", "ausente"]
+    assert [int(row["dominios"]) for row in table] == [1, 3, 1, 1]
+    assert [float(row["percentual_dominios"]) for row in table] == pytest.approx(
+        [100 / 6, 50, 100 / 6, 100 / 6]
+    )
+    assert [int(row["requisicoes"]) for row in table] == [100, 20, 30, 50]
+    assert [float(row["percentual_requisicoes"]) for row in table] == [50, 10, 15, 25]
+    assert [float(row["media_requisicoes_por_dominio"]) for row in table] == [
+        100,
+        10,
+        30,
+        50,
+    ]
